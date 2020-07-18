@@ -7,7 +7,7 @@ import numpy as np
 
 
 def main():
-    env = StarCraft2Env(map_name="8m")
+    env = StarCraft2Env(map_name="3s5z", debug=False)#, vip_allies=[0, 0, 0, 0, 0, 1, 0, 1], vip_enemies=[1, 1, 0, 0, 1, 1, 0, 0])
     env_info = env.get_env_info()
 
     n_actions = env_info["n_actions"]

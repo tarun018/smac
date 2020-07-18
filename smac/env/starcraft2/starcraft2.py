@@ -94,6 +94,10 @@ class StarCraft2Env(MultiAgentEnv):
         heuristic_ai=False,
         heuristic_rest=False,
         debug=False,
+        vip_death_scale=1.5,
+        vip_health_scale=1.5,
+        vip_enemies=None,
+        vip_allies=None
     ):
         """
         Create a StarCraftC2Env environment.
@@ -233,6 +237,8 @@ class StarCraft2Env(MultiAgentEnv):
         self.heuristic_ai = heuristic_ai
         self.heuristic_rest = heuristic_rest
         self.debug = debug
+        if self.debug:
+            logging.set_verbosity(logging.DEBUG)
         self.window_size = (window_size_x, window_size_y)
         self.replay_dir = replay_dir
         self.replay_prefix = replay_prefix
@@ -250,10 +256,6 @@ class StarCraft2Env(MultiAgentEnv):
         self.unit_type_bits = map_params["unit_type_bits"]
         self.map_type = map_params["map_type"]
 
-        self.max_reward = (
-            self.n_enemies * self.reward_death_value + self.reward_win
-        )
-
         self.agents = {}
         self.enemies = {}
         self._episode_count = 0
@@ -267,6 +269,7 @@ class StarCraft2Env(MultiAgentEnv):
         self.last_stats = None
         self.death_tracker_ally = np.zeros(self.n_agents)
         self.death_tracker_enemy = np.zeros(self.n_enemies)
+
         self.previous_ally_units = None
         self.previous_enemy_units = None
         self.last_action = np.zeros((self.n_agents, self.n_actions))
@@ -283,6 +286,24 @@ class StarCraft2Env(MultiAgentEnv):
         self._run_config = None
         self._sc2_proc = None
         self._controller = None
+
+        # VIP Stuff
+        self.vip_allies = vip_allies
+        self.vip_enemies = vip_enemies
+        self.vip_death_scale = vip_death_scale
+        self.vip_health_scale = vip_health_scale
+        self.vip_mode = False
+
+        if self.vip_enemies is not None and self.vip_allies is not None:
+            assert len(self.vip_enemies) == self.n_enemies
+            assert len(self.vip_allies) == self.n_agents
+            for _ in range(self.n_enemies):
+                assert self.vip_enemies[_] == 0 or self.vip_enemies[_] == 1
+            for _ in range(self.n_agents):
+                assert self.vip_allies[_] == 0 or self.vip_allies[_] == 1
+            logging.debug("VIP allies: {}".format(self.vip_allies))
+            logging.debug("VIP enemies: {}".format(self.vip_enemies))
+            self.vip_mode = True
 
         # Try to avoid leaking SC2 processes on shutdown
         atexit.register(lambda: self.close())
@@ -679,6 +700,8 @@ class StarCraft2Env(MultiAgentEnv):
         delta_enemy = 0
 
         neg_scale = self.reward_negative_scale
+        vip_death_scale = self.vip_death_scale
+        vip_health_scale = self.vip_health_scale
 
         # update deaths
         for al_id, al_unit in self.agents.items():
@@ -688,15 +711,32 @@ class StarCraft2Env(MultiAgentEnv):
                     self.previous_ally_units[al_id].health
                     + self.previous_ally_units[al_id].shield
                 )
+
+                # VIP allies affect the reward have higher scales
+                # Non-VIP allies only matter if reward_only_positive=False
+
+                if self.vip_mode and self.vip_allies[al_id]:
+                    scale_to_use = vip_death_scale
+                    health_scale = vip_health_scale
+                    logging.debug("Current Ally: {} is VIP".format(al_id))
+                else:
+                    if not self.reward_only_positive:
+                        scale_to_use = neg_scale
+                        health_scale = 1.0
+                    else:
+                        scale_to_use = 0.0
+                        health_scale = 0.0
+
                 if al_unit.health == 0:
                     # just died
+                    logging.debug("Current Ally {}-{} Just Died".format(al_id, prev_health))
                     self.death_tracker_ally[al_id] = 1
-                    if not self.reward_only_positive:
-                        delta_deaths -= self.reward_death_value * neg_scale
-                    delta_ally += prev_health * neg_scale
+                    delta_deaths -= (self.reward_death_value * scale_to_use)
+                    delta_ally += prev_health * health_scale
                 else:
                     # still alive
-                    delta_ally += neg_scale * (
+                    logging.debug("Current Ally {}-{} Still Alive".format(al_id, prev_health - al_unit.health - al_unit.shield))
+                    delta_ally += health_scale * (
                         prev_health - al_unit.health - al_unit.shield
                     )
 
@@ -706,17 +746,41 @@ class StarCraft2Env(MultiAgentEnv):
                     self.previous_enemy_units[e_id].health
                     + self.previous_enemy_units[e_id].shield
                 )
-                if e_unit.health == 0:
-                    self.death_tracker_enemy[e_id] = 1
-                    delta_deaths += self.reward_death_value
-                    delta_enemy += prev_health
-                else:
-                    delta_enemy += prev_health - e_unit.health - e_unit.shield
 
-        if self.reward_only_positive:
-            reward = abs(delta_enemy + delta_deaths)  # shield regeneration
-        else:
-            reward = delta_enemy + delta_deaths - delta_ally
+                # Only VIP enemies affect the reward
+                if self.vip_mode:
+                    if self.vip_enemies[e_id]:
+                        scale_to_use = vip_death_scale
+                        health_scale = vip_health_scale
+                        logging.debug("Current Enemy: {} is VIP".format(e_id))
+                    else:
+                        scale_to_use = 0.0
+                        health_scale = 0.0
+                else:
+                    scale_to_use = 1.0
+                    health_scale = 1.0
+
+                if e_unit.health == 0:
+                    logging.debug("Current Enemy {}-{} Just Died".format(e_id, prev_health))
+                    self.death_tracker_enemy[e_id] = 1
+                    delta_deaths += self.reward_death_value * scale_to_use
+                    delta_enemy += (prev_health * health_scale)
+                else:
+                    logging.debug(
+                        "Current Enemy {}-{} Still Alive".format(e_id, prev_health - e_unit.health - e_unit.shield))
+                    delta_enemy += (prev_health - e_unit.health - e_unit.shield) * health_scale
+
+        logging.debug("death_tracker_ally: {}".format(self.death_tracker_ally))
+        logging.debug("death_tracker_enemy: {}".format(self.death_tracker_enemy))
+        logging.debug("delta_enemy: {}".format(delta_enemy))
+        logging.debug("delta_deaths: {}".format(delta_deaths))
+        logging.debug("delta_ally: {}".format(delta_ally))
+
+        # if self.reward_only_positive:
+        #     reward = abs(delta_enemy + delta_deaths)  # shield regeneration
+        # else:
+        reward = delta_enemy + delta_deaths - delta_ally
+        logging.debug("Final Reward: {}".format(reward))
 
         return reward
 
@@ -946,8 +1010,11 @@ class StarCraft2Env(MultiAgentEnv):
                     ally_feats[i, 1] = dist / sight_range  # distance
                     ally_feats[i, 2] = (al_x - x) / sight_range  # relative X
                     ally_feats[i, 3] = (al_y - y) / sight_range  # relative Y
-
-                    ind = 4
+                    if self.vip_mode:
+                        ally_feats[i, 4] = self.vip_allies[al_id] # is ally VIP?
+                        ind = 5
+                    else:
+                        ind = 4
                     if self.obs_all_health:
                         ally_feats[i, ind] = (
                             al_unit.health / al_unit.health_max
@@ -1024,7 +1091,10 @@ class StarCraft2Env(MultiAgentEnv):
             )
             return obs_concat
 
-        nf_al = 4 + self.shield_bits_ally + self.unit_type_bits
+        if self.vip_mode:
+            nf_al = 5 + self.shield_bits_ally + self.unit_type_bits
+        else:
+            nf_al = 4 + self.shield_bits_ally + self.unit_type_bits
         nf_en = 3 + self.shield_bits_enemy + self.unit_type_bits
 
         ally_state = np.zeros((self.n_agents, nf_al))
@@ -1058,7 +1128,12 @@ class StarCraft2Env(MultiAgentEnv):
                     y - center_y
                 ) / self.max_distance_y  # relative Y
 
-                ind = 4
+                if self.vip_mode:
+                    ally_state[al_id, 4] = self.vip_allies[al_id]
+                    ind = 5
+                else:
+                    ind = 4
+
                 if self.shield_bits_ally > 0:
                     max_shield = self.unit_max_shield(al_unit)
                     ally_state[al_id, ind] = (
@@ -1130,7 +1205,10 @@ class StarCraft2Env(MultiAgentEnv):
         """Returns the dimensions of the matrix containing ally features.
         Size is n_allies x n_features.
         """
-        nf_al = 4 + self.unit_type_bits
+        if self.vip_mode:
+            nf_al = 5 + self.unit_type_bits
+        else:
+            nf_al = 4 + self.unit_type_bits
 
         if self.obs_all_health:
             nf_al += 1 + self.shield_bits_ally
@@ -1353,13 +1431,37 @@ class StarCraft2Env(MultiAgentEnv):
             self.agents = {}
             self.enemies = {}
 
+            if self._episode_count == 0:
+                if self.vip_mode:
+                    self.number_vip_enemies = sum(self.vip_enemies)
+                    self.max_reward = (
+                            (self.number_vip_enemies * self.reward_death_value * self.vip_death_scale) + self.reward_win
+                    )
+                else:
+                    self.max_reward = (
+                            self.n_enemies * self.reward_death_value + self.reward_win
+                    )
+
             ally_units = [
                 unit
                 for unit in self._obs.observation.raw_data.units
                 if unit.owner == 1
             ]
+
             ally_units_sorted = sorted(
                 ally_units,
+                key=attrgetter("unit_type", "pos.x", "pos.y"),
+                reverse=False,
+            )
+
+            enemy_units = [
+                unit
+                for unit in self._obs.observation.raw_data.units
+                if unit.owner == 2
+            ]
+
+            enemy_units_sorted = sorted(
+                enemy_units,
                 key=attrgetter("unit_type", "pos.x", "pos.y"),
                 reverse=False,
             )
@@ -1368,19 +1470,38 @@ class StarCraft2Env(MultiAgentEnv):
                 self.agents[i] = ally_units_sorted[i]
                 if self.debug:
                     logging.debug(
-                        "Unit {} is {}, x = {}, y = {}".format(
+                        "Ally Unit {} is {}, x = {}, y = {}, health_max = {}, shield_max = {}".format(
                             len(self.agents),
                             self.agents[i].unit_type,
                             self.agents[i].pos.x,
                             self.agents[i].pos.y,
+                            self.agents[i].health_max,
+                            self.agents[i].shield_max
                         )
                     )
 
-            for unit in self._obs.observation.raw_data.units:
-                if unit.owner == 2:
-                    self.enemies[len(self.enemies)] = unit
-                    if self._episode_count == 0:
-                        self.max_reward += unit.health_max + unit.shield_max
+            for i in range(len(enemy_units_sorted)):
+                self.enemies[i] = enemy_units_sorted[i]
+            # for unit in self._obs.observation.raw_data.units:
+            #     if unit.owner == 2:
+            #         self.enemies[len(self.enemies)] = unit
+                if self.debug:
+                    logging.debug(
+                        "Enemy Unit {} is {}, x = {}, y = {}, health_max = {}, shield_max = {}".format(
+                            len(self.enemies),
+                            self.enemies[i].unit_type,
+                            self.enemies[i].pos.x,
+                            self.enemies[i].pos.y,
+                            self.enemies[i].health_max,
+                            self.enemies[i].shield_max
+                        )
+                    )
+                if self._episode_count == 0:
+                    if self.vip_mode:
+                        if self.vip_enemies[i]:
+                            self.max_reward += (self.enemies[i].health_max + self.enemies[i].shield_max) * self.vip_health_scale
+                    else:
+                        self.max_reward += self.enemies[i].health_max + self.enemies[i].shield_max
 
             if self._episode_count == 0:
                 min_unit_type = min(
@@ -1392,6 +1513,7 @@ class StarCraft2Env(MultiAgentEnv):
             all_enemies_created = (len(self.enemies) == self.n_enemies)
 
             if all_agents_created and all_enemies_created:  # all good
+                logging.debug("Max Reward: {}".format(self.max_reward))
                 return
 
             try:

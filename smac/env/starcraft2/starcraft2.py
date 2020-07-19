@@ -305,8 +305,63 @@ class StarCraft2Env(MultiAgentEnv):
             logging.debug("VIP enemies: {}".format(self.vip_enemies))
             self.vip_mode = True
 
+        self.feature_vector = self.generate_feature_vector()
+        self.weight_vector = self.generateWeightVector()
+        # print(self.weight_vector.shape)
         # Try to avoid leaking SC2 processes on shutdown
         atexit.register(lambda: self.close())
+
+    def generate_feature_vector(self):
+        feats = []
+        for al_id in range(self.n_agents):
+            feats.append(("health_diff", "ally", al_id))
+            feats.append(("dead", "ally", al_id))
+        for e_id in range(self.n_enemies):
+            feats.append(("health_diff", "enemy", e_id))
+            feats.append(("dead", "enemy", e_id))
+        feats.append("win")
+        return feats
+
+    def generateWeightVector(self):
+        al_weights = []
+        en_weights = []
+
+        for al_id in range(self.n_agents):
+
+            if self.vip_mode and self.vip_allies[al_id]:
+                scale_to_use = self.vip_death_scale
+                health_scale = self.vip_health_scale
+            else:
+                if not self.reward_only_positive:
+                    scale_to_use = self.reward_negative_scale
+                    health_scale = 1.0
+                else:
+                    scale_to_use = 0.0
+                    health_scale = 0.0
+
+            al_weights.append(-1.0 * health_scale)
+            al_weights.append(-1.0 * self.reward_death_value * scale_to_use)
+
+        for e_id in range(self.n_enemies):
+
+            # Only VIP enemies affect the reward
+            if self.vip_mode:
+                if self.vip_enemies[e_id]:
+                    scale_to_use = self.vip_death_scale
+                    health_scale = self.vip_health_scale
+                else:
+                    scale_to_use = 0.0
+                    health_scale = 0.0
+            else:
+                scale_to_use = 1.0
+                health_scale = 1.0
+
+            en_weights.append(health_scale)
+            en_weights.append(scale_to_use * self.reward_death_value)
+
+        en_weights.append(self.reward_win)
+
+        return np.concatenate((np.array(al_weights), np.array(en_weights)), axis=0)
 
     def _launch(self):
         """Launch the StarCraft II game."""
@@ -451,7 +506,7 @@ class StarCraft2Env(MultiAgentEnv):
         game_end_code = self.update_units()
 
         terminated = False
-        reward = self.reward_battle()
+        reward, step_feature = self.reward_battle()
         info = {"battle_won": False}
 
         if game_end_code is not None:
@@ -462,6 +517,7 @@ class StarCraft2Env(MultiAgentEnv):
                 self.battles_won += 1
                 self.win_counted = True
                 info["battle_won"] = True
+                step_feature[-1] = 1.0
                 if not self.reward_sparse:
                     reward += self.reward_win
                 else:
@@ -490,7 +546,10 @@ class StarCraft2Env(MultiAgentEnv):
         if self.reward_scale:
             reward /= self.max_reward / self.reward_scale_rate
 
-        return reward, terminated, info
+        assert abs(np.dot(step_feature, self.weight_vector) - reward) < 1e-5, print(
+            np.dot(step_feature, self.weight_vector), reward)
+
+        return reward, step_feature, terminated, info
 
     def get_agent_action(self, a_id, action):
         """Construct the action for agent a_id."""
@@ -694,6 +753,8 @@ class StarCraft2Env(MultiAgentEnv):
         if self.reward_sparse:
             return 0
 
+        step_feature = np.zeros(shape=self.weight_vector.shape)
+
         reward = 0
         delta_deaths = 0
         delta_ally = 0
@@ -711,6 +772,11 @@ class StarCraft2Env(MultiAgentEnv):
                     self.previous_ally_units[al_id].health
                     + self.previous_ally_units[al_id].shield
                 )
+
+                health_diff_feature_index = self.feature_vector.index(("health_diff", "ally", al_id))
+                dead_feature_index = self.feature_vector.index(("dead", "ally", al_id))
+                # print(self.feature_vector[health_diff_feature_index])
+                # print(self.feature_vector[dead_feature_index])
 
                 # VIP allies affect the reward have higher scales
                 # Non-VIP allies only matter if reward_only_positive=False
@@ -733,12 +799,17 @@ class StarCraft2Env(MultiAgentEnv):
                     self.death_tracker_ally[al_id] = 1
                     delta_deaths -= (self.reward_death_value * scale_to_use)
                     delta_ally += prev_health * health_scale
+                    step_feature[health_diff_feature_index] = prev_health
+                    step_feature[dead_feature_index] = 1.0
                 else:
                     # still alive
                     logging.debug("Current Ally {}-{} Still Alive".format(al_id, prev_health - al_unit.health - al_unit.shield))
                     delta_ally += health_scale * (
                         prev_health - al_unit.health - al_unit.shield
                     )
+                    step_feature[health_diff_feature_index] = prev_health - al_unit.health - al_unit.shield
+                    step_feature[dead_feature_index] = 0.0
+
 
         for e_id, e_unit in self.enemies.items():
             if not self.death_tracker_enemy[e_id]:
@@ -746,6 +817,9 @@ class StarCraft2Env(MultiAgentEnv):
                     self.previous_enemy_units[e_id].health
                     + self.previous_enemy_units[e_id].shield
                 )
+
+                health_diff_feature_index = self.feature_vector.index(("health_diff", "enemy", e_id))
+                dead_feature_index = self.feature_vector.index(("dead", "enemy", e_id))
 
                 # Only VIP enemies affect the reward
                 if self.vip_mode:
@@ -765,10 +839,14 @@ class StarCraft2Env(MultiAgentEnv):
                     self.death_tracker_enemy[e_id] = 1
                     delta_deaths += self.reward_death_value * scale_to_use
                     delta_enemy += (prev_health * health_scale)
+                    step_feature[health_diff_feature_index] = prev_health
+                    step_feature[dead_feature_index] = 1.0
                 else:
                     logging.debug(
                         "Current Enemy {}-{} Still Alive".format(e_id, prev_health - e_unit.health - e_unit.shield))
                     delta_enemy += (prev_health - e_unit.health - e_unit.shield) * health_scale
+                    step_feature[health_diff_feature_index] = prev_health - e_unit.health - e_unit.shield
+                    step_feature[dead_feature_index] = 0.0
 
         logging.debug("death_tracker_ally: {}".format(self.death_tracker_ally))
         logging.debug("death_tracker_enemy: {}".format(self.death_tracker_enemy))
@@ -782,7 +860,7 @@ class StarCraft2Env(MultiAgentEnv):
         reward = delta_enemy + delta_deaths - delta_ally
         logging.debug("Final Reward: {}".format(reward))
 
-        return reward
+        return reward, step_feature
 
     def get_total_actions(self):
         """Returns the total number of actions an agent could ever take."""
@@ -1513,6 +1591,10 @@ class StarCraft2Env(MultiAgentEnv):
             all_enemies_created = (len(self.enemies) == self.n_enemies)
 
             if all_agents_created and all_enemies_created:  # all good
+                if self._episode_count == 0:
+                    self.weight_vector /= self.max_reward / self.reward_scale_rate
+                    for feat_id, feat in enumerate(self.feature_vector):
+                        print(feat, self.weight_vector[feat_id])
                 logging.debug("Max Reward: {}".format(self.max_reward))
                 return
 

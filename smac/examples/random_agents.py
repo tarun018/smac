@@ -7,7 +7,7 @@ import numpy as np
 
 
 def main():
-    env = StarCraft2Env(map_name="3s5z", debug=False)#, vip_allies=[0, 0, 0, 0, 0, 1, 0, 1], vip_enemies=[1, 1, 0, 0, 1, 1, 0, 0])
+    env = StarCraft2Env(map_name="3s5z", difficulty="1", reward_only_positive=False, reward_negative_scale=0.2, debug=False, vip_allies=[0, 0, 0, 0, 0, 1, 0, 1], vip_enemies=[1, 1, 0, 0, 1, 1, 0, 0])
     env_info = env.get_env_info()
 
     n_actions = env_info["n_actions"]
@@ -31,7 +31,7 @@ def main():
                 action = np.random.choice(avail_actions_ind)
                 actions.append(action)
 
-            reward, terminated, _ = env.step(actions)
+            reward, feature, terminated, _ = env.step(actions)
             episode_reward += reward
 
         print("Total reward in episode {} = {}".format(e, episode_reward))

@@ -790,7 +790,8 @@ class StarCraft2Env(MultiAgentEnv):
                 if self.vip_mode and self.vip_allies[al_id]:
                     scale_to_use = vip_death_scale
                     health_scale = vip_health_scale
-                    logging.debug("Current Ally: {} is VIP".format(al_id))
+                    if self.debug:
+                        logging.debug("Current Ally: {} is VIP".format(al_id))
                 else:
                     if not self.reward_only_positive:
                         scale_to_use = neg_scale

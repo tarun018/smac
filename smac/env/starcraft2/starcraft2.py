@@ -1351,7 +1351,11 @@ class StarCraft2Env(MultiAgentEnv):
         if self.obs_instead_of_state:
             return self.get_obs_size() * self.n_agents
 
-        nf_al = 4 + self.shield_bits_ally + self.unit_type_bits
+        if self.vip_mode:
+            nf_al = 5 + self.shield_bits_ally + self.unit_type_bits
+        else:
+            nf_al = 4 + self.shield_bits_ally + self.unit_type_bits
+
         nf_en = 3 + self.shield_bits_enemy + self.unit_type_bits
 
         enemy_state = self.n_enemies * nf_en

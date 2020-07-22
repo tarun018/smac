@@ -509,7 +509,9 @@ class StarCraft2Env(MultiAgentEnv):
         self._episode_steps += 1
 
         # Update units
-        game_end_code = self.update_units()
+        game_end_code, step_info_alive = self.update_units()
+        if self.debug:
+            logging.debug("game_end_code: {}".format(game_end_code))
 
         terminated = False
         reward, step_feature = self.reward_battle()
@@ -519,6 +521,9 @@ class StarCraft2Env(MultiAgentEnv):
             # Battle is over
             terminated = True
             self.battles_game += 1
+            if step_info_alive != None:
+                info.update(step_info_alive)
+
             if game_end_code == 1 and not self.win_counted:
                 self.battles_won += 1
                 self.win_counted = True
@@ -1634,6 +1639,9 @@ class StarCraft2Env(MultiAgentEnv):
         n_ally_alive = 0
         n_enemy_alive = 0
 
+        n_ally_vip_alive = 0
+        n_enemy_vip_alive = 0
+
         # Store previous state
         self.previous_ally_units = deepcopy(self.agents)
         self.previous_enemy_units = deepcopy(self.enemies)
@@ -1645,6 +1653,8 @@ class StarCraft2Env(MultiAgentEnv):
                     self.agents[al_id] = unit
                     updated = True
                     n_ally_alive += 1
+                    if self.vip_mode and self.vip_allies[al_id]:
+                        n_ally_vip_alive += 1
                     break
 
             if not updated:  # dead
@@ -1657,21 +1667,44 @@ class StarCraft2Env(MultiAgentEnv):
                     self.enemies[e_id] = unit
                     updated = True
                     n_enemy_alive += 1
+                    if self.vip_mode and self.vip_enemies[e_id]:
+                        n_enemy_vip_alive += 1
                     break
 
             if not updated:  # dead
                 e_unit.health = 0
 
-        if (n_ally_alive == 0 and n_enemy_alive > 0
-                or self.only_medivac_left(ally=True)):
-            return -1  # lost
-        if (n_ally_alive > 0 and n_enemy_alive == 0
-                or self.only_medivac_left(ally=False)):
-            return 1  # won
-        if n_ally_alive == 0 and n_enemy_alive == 0:
-            return 0
+        if self.debug:
+            logging.debug("n_ally_alive: {}".format(n_ally_alive))
+            logging.debug("n_enemy_alive: {}".format(n_enemy_alive))
+            logging.debug("n_ally_vip_alive: {}".format(n_ally_vip_alive))
+            logging.debug("n_enemy_vip_alive: {}".format(n_enemy_vip_alive))
 
-        return None
+        step_info_alive = {"n_ally_alive": n_ally_alive,
+                                "n_enemy_alive": n_enemy_alive,
+                                "n_ally_vip_alive": n_ally_vip_alive,
+                                "n_enemy_vip_alive": n_enemy_vip_alive}
+
+        if not self.vip_mode:
+            if (n_ally_alive == 0 and n_enemy_alive > 0
+                    or self.only_medivac_left(ally=True)):
+                return -1, step_info_alive  # lost
+            if (n_ally_alive > 0 and n_enemy_alive == 0
+                    or self.only_medivac_left(ally=False)):
+                return 1, step_info_alive  # won
+            if n_ally_alive == 0 and n_enemy_alive == 0:
+                return 0, step_info_alive
+        else:
+            if (n_ally_alive == 0 and n_enemy_alive > 0
+                    or self.only_medivac_left(ally=True)):
+                return -1, step_info_alive  # lost
+            if (n_ally_alive > 0 and n_enemy_vip_alive == 0
+                    or self.only_medivac_left(ally=False)):
+                return 1, step_info_alive  # won
+            if n_ally_alive == 0 and n_enemy_alive == 0:
+                return 0, step_info_alive
+
+        return None, None
 
     def _init_ally_unit_types(self, min_unit_type):
         """Initialise ally unit types. Should be called once from the

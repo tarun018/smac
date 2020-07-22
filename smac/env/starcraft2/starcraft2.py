@@ -311,6 +311,12 @@ class StarCraft2Env(MultiAgentEnv):
         # Try to avoid leaking SC2 processes on shutdown
         atexit.register(lambda: self.close())
 
+    def get_feature_vector(self):
+        return self.feature_vector
+
+    def get_weight_vector(self):
+        return self.weight_vector
+
     def generate_feature_vector(self):
         feats = []
         for al_id in range(self.n_agents):
@@ -854,12 +860,15 @@ class StarCraft2Env(MultiAgentEnv):
         logging.debug("delta_deaths: {}".format(delta_deaths))
         logging.debug("delta_ally: {}".format(delta_ally))
 
-        # if self.reward_only_positive:
-        #     reward = abs(delta_enemy + delta_deaths)  # shield regeneration
-        # else:
-        reward = delta_enemy + delta_deaths - delta_ally
-        logging.debug("Final Reward: {}".format(reward))
+        if self.vip_mode:
+            reward = delta_enemy + delta_deaths - delta_ally
+        else:
+            if self.reward_only_positive:
+                reward = abs(delta_enemy + delta_deaths)  # shield regeneration
+            else:
+                reward = delta_enemy + delta_deaths - delta_ally
 
+        logging.debug("Final Reward: {}".format(reward))
         return reward, step_feature
 
     def get_total_actions(self):

@@ -801,7 +801,8 @@ class StarCraft2Env(MultiAgentEnv):
 
                 if al_unit.health == 0:
                     # just died
-                    logging.debug("Current Ally {}-{} Just Died".format(al_id, prev_health))
+                    if self.debug:
+                        logging.debug("Current Ally {}-{} Just Died".format(al_id, prev_health))
                     self.death_tracker_ally[al_id] = 1
                     delta_deaths -= (self.reward_death_value * scale_to_use)
                     delta_ally += prev_health * health_scale
@@ -809,7 +810,8 @@ class StarCraft2Env(MultiAgentEnv):
                     step_feature[dead_feature_index] = 1.0
                 else:
                     # still alive
-                    logging.debug("Current Ally {}-{} Still Alive".format(al_id, prev_health - al_unit.health - al_unit.shield))
+                    if self.debug:
+                        logging.debug("Current Ally {}-{} Still Alive".format(al_id, prev_health - al_unit.health - al_unit.shield))
                     delta_ally += health_scale * (
                         prev_health - al_unit.health - al_unit.shield
                     )
@@ -832,7 +834,8 @@ class StarCraft2Env(MultiAgentEnv):
                     if self.vip_enemies[e_id]:
                         scale_to_use = vip_death_scale
                         health_scale = vip_health_scale
-                        logging.debug("Current Enemy: {} is VIP".format(e_id))
+                        if self.debug:
+                            logging.debug("Current Enemy: {} is VIP".format(e_id))
                     else:
                         scale_to_use = 0.0
                         health_scale = 0.0
@@ -841,24 +844,27 @@ class StarCraft2Env(MultiAgentEnv):
                     health_scale = 1.0
 
                 if e_unit.health == 0:
-                    logging.debug("Current Enemy {}-{} Just Died".format(e_id, prev_health))
+                    if self.debug:
+                        logging.debug("Current Enemy {}-{} Just Died".format(e_id, prev_health))
                     self.death_tracker_enemy[e_id] = 1
                     delta_deaths += self.reward_death_value * scale_to_use
                     delta_enemy += (prev_health * health_scale)
                     step_feature[health_diff_feature_index] = prev_health
                     step_feature[dead_feature_index] = 1.0
                 else:
-                    logging.debug(
-                        "Current Enemy {}-{} Still Alive".format(e_id, prev_health - e_unit.health - e_unit.shield))
+                    if self.debug:
+                        logging.debug("Current Enemy {}-{} Still Alive".
+                                      format(e_id, prev_health - e_unit.health - e_unit.shield))
                     delta_enemy += (prev_health - e_unit.health - e_unit.shield) * health_scale
                     step_feature[health_diff_feature_index] = prev_health - e_unit.health - e_unit.shield
                     step_feature[dead_feature_index] = 0.0
 
-        logging.debug("death_tracker_ally: {}".format(self.death_tracker_ally))
-        logging.debug("death_tracker_enemy: {}".format(self.death_tracker_enemy))
-        logging.debug("delta_enemy: {}".format(delta_enemy))
-        logging.debug("delta_deaths: {}".format(delta_deaths))
-        logging.debug("delta_ally: {}".format(delta_ally))
+        if self.debug:
+            logging.debug("death_tracker_ally: {}".format(self.death_tracker_ally))
+            logging.debug("death_tracker_enemy: {}".format(self.death_tracker_enemy))
+            logging.debug("delta_enemy: {}".format(delta_enemy))
+            logging.debug("delta_deaths: {}".format(delta_deaths))
+            logging.debug("delta_ally: {}".format(delta_ally))
 
         if self.vip_mode:
             reward = delta_enemy + delta_deaths - delta_ally
@@ -868,7 +874,8 @@ class StarCraft2Env(MultiAgentEnv):
             else:
                 reward = delta_enemy + delta_deaths - delta_ally
 
-        logging.debug("Final Reward: {}".format(reward))
+        if self.debug:
+            logging.debug("Final Reward: {}".format(reward))
         return reward, step_feature
 
     def get_total_actions(self):
@@ -1604,7 +1611,8 @@ class StarCraft2Env(MultiAgentEnv):
                     self.weight_vector /= self.max_reward / self.reward_scale_rate
                     for feat_id, feat in enumerate(self.feature_vector):
                         print(feat, self.weight_vector[feat_id])
-                logging.debug("Max Reward: {}".format(self.max_reward))
+                if self.debug:
+                    logging.debug("Max Reward: {}".format(self.max_reward))
                 return
 
             try:

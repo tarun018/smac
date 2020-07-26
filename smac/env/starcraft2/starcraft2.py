@@ -305,8 +305,6 @@ class StarCraft2Env(MultiAgentEnv):
             logging.debug("VIP enemies: {}".format(self.vip_enemies))
             self.vip_mode = True
 
-        self.feature_vector = self.generate_feature_vector()
-        self.weight_vector = self.generateWeightVector()
         # print(self.weight_vector.shape)
         # Try to avoid leaking SC2 processes on shutdown
         atexit.register(lambda: self.close())
@@ -332,7 +330,7 @@ class StarCraft2Env(MultiAgentEnv):
         al_weights = []
         en_weights = []
 
-        for al_id in range(self.n_agents):
+        for al_id, al_unit in self.agents.items():
 
             if self.vip_mode and self.vip_allies[al_id]:
                 scale_to_use = self.vip_death_scale
@@ -345,10 +343,10 @@ class StarCraft2Env(MultiAgentEnv):
                     scale_to_use = 0.0
                     health_scale = 0.0
 
-            al_weights.append(-1.0 * health_scale)
+            al_weights.append(-1.0 * health_scale * (al_unit.health_max + al_unit.shield_max))
             al_weights.append(-1.0 * self.reward_death_value * scale_to_use)
 
-        for e_id in range(self.n_enemies):
+        for e_id, e_unit in self.enemies.items():
 
             # Only VIP enemies affect the reward
             if self.vip_mode:
@@ -362,7 +360,7 @@ class StarCraft2Env(MultiAgentEnv):
                 scale_to_use = 1.0
                 health_scale = 1.0
 
-            en_weights.append(health_scale)
+            en_weights.append(health_scale * (e_unit.health_max + e_unit.shield_max))
             en_weights.append(scale_to_use * self.reward_death_value)
 
         en_weights.append(self.reward_win)
@@ -812,7 +810,7 @@ class StarCraft2Env(MultiAgentEnv):
                     self.death_tracker_ally[al_id] = 1
                     delta_deaths -= (self.reward_death_value * scale_to_use)
                     delta_ally += prev_health * health_scale
-                    step_feature[health_diff_feature_index] = prev_health
+                    step_feature[health_diff_feature_index] = prev_health / (al_unit.health_max + al_unit.shield_max)
                     step_feature[dead_feature_index] = 1.0
                 else:
                     # still alive
@@ -821,7 +819,7 @@ class StarCraft2Env(MultiAgentEnv):
                     delta_ally += health_scale * (
                         prev_health - al_unit.health - al_unit.shield
                     )
-                    step_feature[health_diff_feature_index] = prev_health - al_unit.health - al_unit.shield
+                    step_feature[health_diff_feature_index] = (prev_health - al_unit.health - al_unit.shield) / (al_unit.health_max + al_unit.shield_max)
                     step_feature[dead_feature_index] = 0.0
 
 
@@ -855,14 +853,15 @@ class StarCraft2Env(MultiAgentEnv):
                     self.death_tracker_enemy[e_id] = 1
                     delta_deaths += self.reward_death_value * scale_to_use
                     delta_enemy += (prev_health * health_scale)
-                    step_feature[health_diff_feature_index] = prev_health
+                    step_feature[health_diff_feature_index] = prev_health / (e_unit.health_max + e_unit.shield_max)
                     step_feature[dead_feature_index] = 1.0
                 else:
                     if self.debug:
                         logging.debug("Current Enemy {}-{} Still Alive".
                                       format(e_id, prev_health - e_unit.health - e_unit.shield))
                     delta_enemy += (prev_health - e_unit.health - e_unit.shield) * health_scale
-                    step_feature[health_diff_feature_index] = prev_health - e_unit.health - e_unit.shield
+                    step_feature[health_diff_feature_index] = (prev_health - e_unit.health - e_unit.shield) \
+                                                              / (e_unit.health_max + e_unit.shield_max)
                     step_feature[dead_feature_index] = 0.0
 
         if self.debug:
@@ -1618,6 +1617,8 @@ class StarCraft2Env(MultiAgentEnv):
 
             if all_agents_created and all_enemies_created:  # all good
                 if self._episode_count == 0:
+                    self.feature_vector = self.generate_feature_vector()
+                    self.weight_vector = self.generateWeightVector()
                     self.weight_vector /= self.max_reward / self.reward_scale_rate
                     for feat_id, feat in enumerate(self.feature_vector):
                         print(feat, self.weight_vector[feat_id])

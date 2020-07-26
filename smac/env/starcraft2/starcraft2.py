@@ -501,7 +501,7 @@ class StarCraft2Env(MultiAgentEnv):
             self._obs = self._controller.observe()
         except (protocol.ProtocolError, protocol.ConnectionError):
             self.full_restart()
-            return 0, True, {}
+            return 0, np.zeros(self.weight_vector.shape), True, {}
 
         self._total_steps += 1
         self._episode_steps += 1
@@ -1696,13 +1696,13 @@ class StarCraft2Env(MultiAgentEnv):
             if n_ally_alive == 0 and n_enemy_alive == 0:
                 return 0, step_info_alive
         else:
-            if (n_ally_alive == 0 and n_enemy_alive > 0
+            if (n_enemy_vip_alive == 0 and n_enemy_vip_alive > 0
                     or self.only_medivac_left(ally=True)):
                 return -1, step_info_alive  # lost
-            if (n_ally_alive > 0 and n_enemy_vip_alive == 0
+            if (n_ally_vip_alive > 0 and n_enemy_vip_alive == 0
                     or self.only_medivac_left(ally=False)):
                 return 1, step_info_alive  # won
-            if n_ally_alive == 0 and n_enemy_alive == 0:
+            if n_ally_vip_alive == 0 and n_enemy_vip_alive == 0:
                 return 0, step_info_alive
 
         return None, None

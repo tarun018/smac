@@ -445,6 +445,7 @@ class StarCraft2Env(MultiAgentEnv):
             self._obs = self._controller.observe()
             self.init_units()
         except (protocol.ProtocolError, protocol.ConnectionError):
+            print("Full Restart with either _controller.observe or init_units.")
             self.full_restart()
 
         if self.debug:
@@ -462,10 +463,12 @@ class StarCraft2Env(MultiAgentEnv):
             self._kill_all_units()
             self._controller.step(2)
         except (protocol.ProtocolError, protocol.ConnectionError):
+            print("Full Restart with either _kill_all_units or _controller.step(2).")
             self.full_restart()
 
     def full_restart(self):
         """Full restart. Closes the SC2 process and launches a new one. """
+        print("Doing a full restart.")
         self._sc2_proc.close()
         self._launch()
         self.force_restarts += 1
@@ -500,6 +503,7 @@ class StarCraft2Env(MultiAgentEnv):
             # Observe here so that we know if the episode is over.
             self._obs = self._controller.observe()
         except (protocol.ProtocolError, protocol.ConnectionError):
+            print("Full Restart with either of _controller.actions, _controller.step, _controller.observe.")
             self.full_restart()
             return 0, np.zeros(self.weight_vector.shape), True, {}
 
@@ -507,7 +511,7 @@ class StarCraft2Env(MultiAgentEnv):
         self._episode_steps += 1
 
         # Update units
-        game_end_code, step_info_alive = self.update_units()
+        game_end_code = self.update_units()
         if self.debug:
             logging.debug("game_end_code: {}".format(game_end_code))
 
@@ -517,22 +521,27 @@ class StarCraft2Env(MultiAgentEnv):
 
         # count units that are still alive
         dead_allies, dead_enemies = 0, 0
+        dead_vip_allies, dead_vip_enemies = 0, 0
         for al_id, al_unit in self.agents.items():
             if al_unit.health == 0:
                 dead_allies += 1
+                if self.vip_mode and self.vip_allies[al_id]:
+                    dead_vip_allies += 1
         for e_id, e_unit in self.enemies.items():
             if e_unit.health == 0:
                 dead_enemies += 1
+                if self.vip_mode and self.vip_enemies[e_id]:
+                    dead_vip_enemies += 1
 
         info['dead_allies'] = dead_allies
         info['dead_enemies'] = dead_enemies
+        info['dead_vip_allies'] = dead_vip_allies
+        info['dead_vip_enemies'] = dead_vip_enemies
 
         if game_end_code is not None:
             # Battle is over
             terminated = True
             self.battles_game += 1
-            if step_info_alive != None:
-                info.update(step_info_alive)
 
             if game_end_code == 1 and not self.win_counted:
                 self.battles_won += 1
@@ -1642,6 +1651,7 @@ class StarCraft2Env(MultiAgentEnv):
                 self._controller.step(1)
                 self._obs = self._controller.observe()
             except (protocol.ProtocolError, protocol.ConnectionError):
+                print("Full Restart inside init_units.")
                 self.full_restart()
                 self.reset()
 
@@ -1693,31 +1703,26 @@ class StarCraft2Env(MultiAgentEnv):
             logging.debug("n_ally_vip_alive: {}".format(n_ally_vip_alive))
             logging.debug("n_enemy_vip_alive: {}".format(n_enemy_vip_alive))
 
-        step_info_alive = {"n_ally_alive": n_ally_alive,
-                                "n_enemy_alive": n_enemy_alive,
-                                "n_ally_vip_alive": n_ally_vip_alive,
-                                "n_enemy_vip_alive": n_enemy_vip_alive}
-
         if not self.vip_mode:
             if (n_ally_alive == 0 and n_enemy_alive > 0
                     or self.only_medivac_left(ally=True)):
-                return -1, step_info_alive  # lost
+                return -1  # lost
             if (n_ally_alive > 0 and n_enemy_alive == 0
                     or self.only_medivac_left(ally=False)):
-                return 1, step_info_alive  # won
+                return 1  # won
             if n_ally_alive == 0 and n_enemy_alive == 0:
-                return 0, step_info_alive
+                return 0
         else:
             if (n_enemy_vip_alive == 0 and n_enemy_vip_alive > 0
                     or self.only_medivac_left(ally=True)):
-                return -1, step_info_alive  # lost
+                return -1  # lost
             if (n_ally_vip_alive > 0 and n_enemy_vip_alive == 0
                     or self.only_medivac_left(ally=False)):
-                return 1, step_info_alive  # won
+                return 1  # won
             if n_ally_vip_alive == 0 and n_enemy_vip_alive == 0:
-                return 0, step_info_alive
+                return 0
 
-        return None, None
+        return None
 
     def _init_ally_unit_types(self, min_unit_type):
         """Initialise ally unit types. Should be called once from the

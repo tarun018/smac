@@ -295,9 +295,10 @@ class StarCraft2Env(MultiAgentEnv):
 
     def generate_feature_vector(self):
         feats = []
-        for al_id in range(self.n_agents):
-            feats.append(("health_diff", "ally", al_id))
-            feats.append(("dead", "ally", al_id))
+        if not self.reward_only_positive:
+            for al_id in range(self.n_agents):
+                feats.append(("health_diff", "ally", al_id))
+                feats.append(("dead", "ally", al_id))
         for e_id in range(self.n_enemies):
             feats.append(("health_diff", "enemy", e_id))
             feats.append(("dead", "enemy", e_id))
@@ -308,17 +309,13 @@ class StarCraft2Env(MultiAgentEnv):
         al_weights = []
         en_weights = []
 
-        for al_id, al_unit in self.agents.items():
-
-            if not self.reward_only_positive:
+        if not self.reward_only_positive:
+            for al_id, al_unit in self.agents.items():
                 scale_to_use = self.reward_negative_scale
-                health_scale = 1.0
-            else:
-                scale_to_use = 0.0
-                health_scale = 0.0
+                health_scale = self.reward_negative_scale
 
-            al_weights.append(-1.0 * health_scale * (al_unit.health_max + al_unit.shield_max))
-            al_weights.append(-1.0 * self.reward_death_value * scale_to_use)
+                al_weights.append(-1.0 * health_scale * (al_unit.health_max + al_unit.shield_max))
+                al_weights.append(-1.0 * self.reward_death_value * scale_to_use)
 
         for e_id, e_unit in self.enemies.items():
 
@@ -751,8 +748,9 @@ class StarCraft2Env(MultiAgentEnv):
                     + self.previous_ally_units[al_id].shield
                 )
 
-                health_diff_feature_index = self.feature_vector.index(("health_diff", "ally", al_id))
-                dead_feature_index = self.feature_vector.index(("dead", "ally", al_id))
+                if not self.reward_only_positive:
+                    health_diff_feature_index = self.feature_vector.index(("health_diff", "ally", al_id))
+                    dead_feature_index = self.feature_vector.index(("dead", "ally", al_id))
 
                 if al_unit.health == 0:
                     # just died
@@ -761,17 +759,20 @@ class StarCraft2Env(MultiAgentEnv):
                         delta_deaths -= self.reward_death_value * neg_scale
                     delta_ally += prev_health * neg_scale
 
-                    step_feature[health_diff_feature_index] = prev_health / (al_unit.health_max + al_unit.shield_max)
-                    step_feature[dead_feature_index] = 1.0
+                    if not self.reward_only_positive:
+                        step_feature[health_diff_feature_index] = prev_health / (al_unit.health_max + al_unit.shield_max)
+                        step_feature[dead_feature_index] = 1.0
                 else:
                     # still alive
                     delta_ally += neg_scale * (
                         prev_health - al_unit.health - al_unit.shield
                     )
 
-                    step_feature[health_diff_feature_index] = (prev_health - al_unit.health - al_unit.shield) / (
+                    if not self.reward_only_positive:
+                        step_feature[health_diff_feature_index] = (prev_health - al_unit.health - al_unit.shield) / (
                                 al_unit.health_max + al_unit.shield_max)
-                    step_feature[dead_feature_index] = 0.0
+
+                        step_feature[dead_feature_index] = 0.0
 
         for e_id, e_unit in self.enemies.items():
             if not self.death_tracker_enemy[e_id]:
@@ -795,6 +796,7 @@ class StarCraft2Env(MultiAgentEnv):
 
                     step_feature[health_diff_feature_index] = (prev_health - e_unit.health - e_unit.shield) \
                                                               / (e_unit.health_max + e_unit.shield_max)
+
                     step_feature[dead_feature_index] = 0.0
 
         if self.reward_only_positive:
@@ -1284,7 +1286,7 @@ class StarCraft2Env(MultiAgentEnv):
         are visible to each agent.
         """
         arr = np.zeros(
-            (self.n_agents, self.n_agents + self.n_enemies), 
+            (self.n_agents, self.n_agents + self.n_enemies),
             dtype=np.bool,
         )
 
@@ -1307,7 +1309,7 @@ class StarCraft2Env(MultiAgentEnv):
 
                 # The matrix for allies is filled symmetrically
                 al_ids = [
-                    al_id for al_id in range(self.n_agents) 
+                    al_id for al_id in range(self.n_agents)
                     if al_id > agent_id
                 ]
                 for i, al_id in enumerate(al_ids):
@@ -1316,7 +1318,7 @@ class StarCraft2Env(MultiAgentEnv):
                     al_y = al_unit.pos.y
                     dist = self.distance(x, y, al_x, al_y)
 
-                    if (dist < sight_range and al_unit.health > 0):  
+                    if (dist < sight_range and al_unit.health > 0):
                         # visible and alive
                         arr[agent_id, al_id] = arr[al_id, agent_id] = 1
 
@@ -1448,6 +1450,17 @@ class StarCraft2Env(MultiAgentEnv):
                 reverse=False,
             )
 
+            enemy_units = [
+                unit
+                for unit in self._obs.observation.raw_data.units
+                if unit.owner == 2
+            ]
+            enemy_units_sorted = sorted(
+                enemy_units,
+                key=attrgetter("unit_type", "pos.x", "pos.y"),
+                reverse=False,
+            )
+
             for i in range(len(ally_units_sorted)):
                 self.agents[i] = ally_units_sorted[i]
                 if self.debug:
@@ -1460,11 +1473,19 @@ class StarCraft2Env(MultiAgentEnv):
                         )
                     )
 
-            for unit in self._obs.observation.raw_data.units:
-                if unit.owner == 2:
-                    self.enemies[len(self.enemies)] = unit
-                    if self._episode_count == 0:
-                        self.max_reward += unit.health_max + unit.shield_max
+            for i in range(len(enemy_units_sorted)):
+                self.enemies[i] = enemy_units_sorted[i]
+                if self.debug:
+                    logging.debug(
+                        "Enemy Unit {} is {}, x = {}, y = {}".format(
+                            len(self.enemies),
+                            self.enemies[i].unit_type,
+                            self.enemies[i].pos.x,
+                            self.enemies[i].pos.y
+                        )
+                    )
+                if self._episode_count == 0:
+                    self.max_reward += self.enemies[i].health_max + self.enemies[i].shield_max
 
             if self._episode_count == 0:
                 min_unit_type = min(

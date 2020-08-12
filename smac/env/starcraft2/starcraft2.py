@@ -495,6 +495,7 @@ class StarCraft2Env(MultiAgentEnv):
                 self.battles_won += 1
                 self.win_counted = True
                 info["battle_won"] = True
+                step_feature[-1] = 1.0
                 if not self.reward_sparse:
                     reward += self.reward_win
                 else:

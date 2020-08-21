@@ -21,6 +21,8 @@ from s2clientprotocol import common_pb2 as sc_common
 from s2clientprotocol import sc2api_pb2 as sc_pb
 from s2clientprotocol import raw_pb2 as r_pb
 from s2clientprotocol import debug_pb2 as d_pb
+import traceback
+import sys
 
 races = {
     "R": sc_common.Random,
@@ -428,6 +430,8 @@ class StarCraft2Env(MultiAgentEnv):
 
     def full_restart(self):
         """Full restart. Closes the SC2 process and launches a new one. """
+        print(traceback.format_exc())
+        print(sys.exc_info()[2])
         self._sc2_proc.close()
         self._launch()
         self.force_restarts += 1

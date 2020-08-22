@@ -1376,6 +1376,17 @@ class StarCraft2Env(MultiAgentEnv):
                 reverse=False,
             )
 
+            enemy_units = [
+                unit
+                for unit in self._obs.observation.raw_data.units
+                if unit.owner == 2
+            ]
+            enemy_units_sorted = sorted(
+                enemy_units,
+                key=attrgetter("unit_type", "pos.x", "pos.y"),
+                reverse=False,
+            )
+
             for i in range(len(ally_units_sorted)):
                 self.agents[i] = ally_units_sorted[i]
                 if self.debug:
@@ -1388,11 +1399,25 @@ class StarCraft2Env(MultiAgentEnv):
                         )
                     )
 
-            for unit in self._obs.observation.raw_data.units:
-                if unit.owner == 2:
-                    self.enemies[len(self.enemies)] = unit
-                    if self._episode_count == 0:
-                        self.max_reward += unit.health_max + unit.shield_max
+            for i in range(len(enemy_units_sorted)):
+                self.enemies[i] = enemy_units_sorted[i]
+                if self.debug:
+                    logging.debug(
+                        "Enemy Unit {} is {}, x = {}, y = {}".format(
+                            len(self.enemies),
+                            self.enemies[i].unit_type,
+                            self.enemies[i].pos.x,
+                            self.enemies[i].pos.y
+                        )
+                    )
+                if self._episode_count == 0:
+                    self.max_reward += self.enemies[i].health_max + self.enemies[i].shield_max
+
+            # for unit in self._obs.observation.raw_data.units:
+            #     if unit.owner == 2:
+            #         self.enemies[len(self.enemies)] = unit
+            #         if self._episode_count == 0:
+            #             self.max_reward += unit.health_max + unit.shield_max
 
             if self._episode_count == 0:
                 min_unit_type = min(

@@ -528,8 +528,9 @@ class StarCraft2Env(MultiAgentEnv):
         if self.reward_scale:
             reward /= self.max_reward / self.reward_scale_rate
 
-        assert abs(np.dot(step_feature, self.weight_vector) - reward) < 1e-5, print(
-            np.dot(step_feature, self.weight_vector), reward)
+        if not self.reward_only_positive:
+            assert abs(np.dot(step_feature, self.weight_vector) - reward) < 1e-5, print(
+                np.dot(step_feature, self.weight_vector), reward)
 
         return reward, step_feature, terminated, info
 
@@ -797,22 +798,14 @@ class StarCraft2Env(MultiAgentEnv):
                     step_feature[health_diff_feature_index] = prev_health / (e_unit.health_max + e_unit.shield_max)
                     step_feature[dead_feature_index] = 1.0
                 else:
-                    if self.reward_only_positive:
-                        delta_enemy += abs(prev_health - e_unit.health - e_unit.shield)
-                    else:
-                        delta_enemy += prev_health - e_unit.health - e_unit.shield
-
-                    if self.reward_only_positive:
-                        step_feature[health_diff_feature_index] = abs((prev_health - e_unit.health - e_unit.shield) \
-                                                              / (e_unit.health_max + e_unit.shield_max))
-                    else:
-                        step_feature[health_diff_feature_index] = (prev_health - e_unit.health - e_unit.shield) \
+                    delta_enemy += prev_health - e_unit.health - e_unit.shield
+                    step_feature[health_diff_feature_index] = (prev_health - e_unit.health - e_unit.shield) \
                                                                       / (e_unit.health_max + e_unit.shield_max)
 
                     step_feature[dead_feature_index] = 0.0
 
         if self.reward_only_positive:
-            reward = delta_enemy + delta_deaths  # shield regeneration
+            reward = abs(delta_enemy + delta_deaths)  # shield regeneration
         else:
             reward = delta_enemy + delta_deaths - delta_ally
 

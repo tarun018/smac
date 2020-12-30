@@ -1,17 +1,15 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-from smac.env.multiagentenv import MultiAgentEnv
-from smac.env.starcraft2.maps import get_map_params
-
-import atexit
+from ..multiagentenv import MultiAgentEnv
+from .map_params import get_map_params, map_present
+from utils.dict2namedtuple import convert
 from operator import attrgetter
 from copy import deepcopy
+from absl import flags
 import numpy as np
-import enum
+import pygame
+import sys
+import os
 import math
-from absl import logging
+import time
 
 from pysc2 import maps
 from pysc2 import run_configs
@@ -21,6 +19,17 @@ from s2clientprotocol import common_pb2 as sc_common
 from s2clientprotocol import sc2api_pb2 as sc_pb
 from s2clientprotocol import raw_pb2 as r_pb
 from s2clientprotocol import debug_pb2 as d_pb
+from s2clientprotocol import query_pb2 as q_pb
+
+FLAGS = flags.FLAGS
+FLAGS(['main.py'])
+
+_possible_results = {
+    sc_pb.Victory: 1,
+    sc_pb.Defeat: -1,
+    sc_pb.Tie: 0,
+    sc_pb.Undecided: 0,
+}
 
 races = {
     "R": sc_common.Random,
@@ -42,472 +51,356 @@ difficulties = {
     "A": sc_pb.CheatInsane,
 }
 
-actions = {
-    "move": 16,  # target: PointOrUnit
-    "attack": 23,  # target: PointOrUnit
-    "stop": 4,  # target: None
-    "heal": 386,  # Unit
-}
+action_move_id = 16     #    target: PointOrUnit
+action_attack_id = 23   #    target: PointOrUnit
+action_stop_id = 4      #    target: None
+action_heal_id = 386    #    target: Unit
+action_enter_bunker_id = 407
+action_leave_bunker_id = 408
+action_attack_bunker_id = 1682
+bunker_id = 24
 
+'''
+StarCraft II
+'''
 
-class Direction(enum.IntEnum):
-    NORTH = 0
-    SOUTH = 1
-    EAST = 2
-    WEST = 3
+class SC2(MultiAgentEnv):
 
+    def __init__(self, **kwargs):
 
-class StarCraft2Env(MultiAgentEnv):
-    """The StarCraft II environment for decentralised multi-agent
-    micromanagement scenarios.
-    """
-    def __init__(
-        self,
-        map_name="8m",
-        step_mul=8,
-        move_amount=2,
-        difficulty="7",
-        game_version=None,
-        seed=None,
-        continuing_episode=False,
-        obs_all_health=True,
-        obs_own_health=True,
-        obs_last_action=False,
-        obs_pathing_grid=False,
-        obs_terrain_height=False,
-        obs_instead_of_state=False,
-        obs_timestep_number=False,
-        state_last_action=True,
-        state_timestep_number=False,
-        reward_sparse=False,
-        reward_only_positive=True,
-        reward_death_value=10,
-        reward_win=200,
-        reward_defeat=0,
-        reward_negative_scale=0.5,
-        reward_scale=True,
-        reward_scale_rate=20,
-        replay_dir="",
-        replay_prefix="",
-        window_size_x=1920,
-        window_size_y=1200,
-        heuristic_ai=False,
-        heuristic_rest=False,
-        debug=False,
-    ):
-        """
-        Create a StarCraftC2Env environment.
-
-        Parameters
-        ----------
-        map_name : str, optional
-            The name of the SC2 map to play (default is "8m"). The full list
-            can be found by running bin/map_list.
-        step_mul : int, optional
-            How many game steps per agent step (default is 8). None
-            indicates to use the default map step_mul.
-        move_amount : float, optional
-            How far away units are ordered to move per step (default is 2).
-        difficulty : str, optional
-            The difficulty of built-in computer AI bot (default is "7").
-        game_version : str, optional
-            StarCraft II game version (default is None). None indicates the
-            latest version.
-        seed : int, optional
-            Random seed used during game initialisation. This allows to
-        continuing_episode : bool, optional
-            Whether to consider episodes continuing or finished after time
-            limit is reached (default is False).
-        obs_all_health : bool, optional
-            Agents receive the health of all units (in the sight range) as part
-            of observations (default is True).
-        obs_own_health : bool, optional
-            Agents receive their own health as a part of observations (default
-            is False). This flag is ignored when obs_all_health == True.
-        obs_last_action : bool, optional
-            Agents receive the last actions of all units (in the sight range)
-            as part of observations (default is False).
-        obs_pathing_grid : bool, optional
-            Whether observations include pathing values surrounding the agent
-            (default is False).
-        obs_terrain_height : bool, optional
-            Whether observations include terrain height values surrounding the
-            agent (default is False).
-        obs_instead_of_state : bool, optional
-            Use combination of all agents' observations as the global state
-            (default is False).
-        obs_timestep_number : bool, optional
-            Whether observations include the current timestep of the episode
-            (default is False).
-        state_last_action : bool, optional
-            Include the last actions of all agents as part of the global state
-            (default is True).
-        state_timestep_number : bool, optional
-            Whether the state include the current timestep of the episode
-            (default is False).
-        reward_sparse : bool, optional
-            Receive 1/-1 reward for winning/loosing an episode (default is
-            False). Whe rest of reward parameters are ignored if True.
-        reward_only_positive : bool, optional
-            Reward is always positive (default is True).
-        reward_death_value : float, optional
-            The amount of reward received for killing an enemy unit (default
-            is 10). This is also the negative penalty for having an allied unit
-            killed if reward_only_positive == False.
-        reward_win : float, optional
-            The reward for winning in an episode (default is 200).
-        reward_defeat : float, optional
-            The reward for loosing in an episode (default is 0). This value
-            should be nonpositive.
-        reward_negative_scale : float, optional
-            Scaling factor for negative rewards (default is 0.5). This
-            parameter is ignored when reward_only_positive == True.
-        reward_scale : bool, optional
-            Whether or not to scale the reward (default is True).
-        reward_scale_rate : float, optional
-            Reward scale rate (default is 20). When reward_scale == True, the
-            reward received by the agents is divided by (max_reward /
-            reward_scale_rate), where max_reward is the maximum possible
-            reward per episode without considering the shield regeneration
-            of Protoss units.
-        replay_dir : str, optional
-            The directory to save replays (default is None). If None, the
-            replay will be saved in Replays directory where StarCraft II is
-            installed.
-        replay_prefix : str, optional
-            The prefix of the replay to be saved (default is None). If None,
-            the name of the map will be used.
-        window_size_x : int, optional
-            The length of StarCraft II window size (default is 1920).
-        window_size_y: int, optional
-            The height of StarCraft II window size (default is 1200).
-        heuristic_ai: bool, optional
-            Whether or not to use a non-learning heuristic AI (default False).
-        heuristic_rest: bool, optional
-            At any moment, restrict the actions of the heuristic AI to be
-            chosen from actions available to RL agents (default is False).
-            Ignored if heuristic_ai == False.
-        debug: bool, optional
-            Log messages about observations, state, actions and rewards for
-            debugging purposes (default is False).
-        """
-        # Map arguments
-        self.map_name = map_name
-        map_params = get_map_params(self.map_name)
-        self.n_agents = map_params["n_agents"]
-        self.n_enemies = map_params["n_enemies"]
-        self.episode_limit = map_params["limit"]
-        self._move_amount = move_amount
-        self._step_mul = step_mul
-        self.difficulty = difficulty
-
+        args = kwargs["env_args"]
+        if isinstance(args, dict):
+            args = convert(args)
+        # Read arguments
+        self.map_name = args.map_name
+        assert map_present(self.map_name), \
+            "map {} not in map registry! please add.".format(self.map_name)
+        map_params = convert(get_map_params(self.map_name))
+        self.n_agents = map_params.n_agents
+        self.n_enemies = map_params.n_enemies
+        self.episode_limit = map_params.limit
+        self._move_amount = args.move_amount
+        self._step_mul = args.step_mul
+        self.difficulty = args.difficulty
         # Observations and state
-        self.obs_own_health = obs_own_health
-        self.obs_all_health = obs_all_health
-        self.obs_instead_of_state = obs_instead_of_state
-        self.obs_last_action = obs_last_action
-        self.obs_pathing_grid = obs_pathing_grid
-        self.obs_terrain_height = obs_terrain_height
-        self.obs_timestep_number = obs_timestep_number
-        self.state_last_action = state_last_action
-        self.state_timestep_number = state_timestep_number
+        self.obs_own_health = args.obs_own_health
+        self.obs_all_health = args.obs_all_health
+        self.obs_instead_of_state = args.obs_instead_of_state
+        self.obs_last_action = args.obs_last_action
+        self.obs_pathing_grid = args.obs_pathing_grid
+        self.obs_terrain_height = args.obs_terrain_height
+        self.state_last_action = args.state_last_action
         if self.obs_all_health:
             self.obs_own_health = True
         self.n_obs_pathing = 8
         self.n_obs_height = 9
-
         # Rewards args
-        self.reward_sparse = reward_sparse
-        self.reward_only_positive = reward_only_positive
-        self.reward_negative_scale = reward_negative_scale
-        self.reward_death_value = reward_death_value
-        self.reward_win = reward_win
-        self.reward_defeat = reward_defeat
-        self.reward_scale = reward_scale
-        self.reward_scale_rate = reward_scale_rate
-
+        self.reward_sparse = args.reward_sparse
+        self.reward_only_positive = args.reward_only_positive
+        self.reward_negative_scale = args.reward_negative_scale
+        self.reward_death_value = args.reward_death_value
+        self.reward_win = args.reward_win
+        self.reward_defeat = args.reward_defeat
+        self.reward_scale = args.reward_scale
+        self.reward_scale_rate = args.reward_scale_rate
         # Other
-        self.game_version = game_version
-        self.continuing_episode = continuing_episode
-        self._seed = seed
-        self.heuristic_ai = heuristic_ai
-        self.heuristic_rest = heuristic_rest
-        self.debug = debug
-        self.window_size = (window_size_x, window_size_y)
-        self.replay_dir = replay_dir
-        self.replay_prefix = replay_prefix
+        self.continuing_episode = args.continuing_episode
+        self.seed = args.seed
+        self.heuristic = args.heuristic
+        self.window_size = (2560, 1600)
+        self.save_replay_prefix = args.save_replay_prefix
+        self.restrict_actions = args.restrict_actions
+
+        # For sanity check
+        self.debug_inputs = False
+        self.debug_rewards = False
+
+        # Map info
+        self._agent_race = map_params.a_race
+        self._bot_race = map_params.b_race
+        self.shield_bits_ally = 1 if self._agent_race == "P" else 0
+        self.shield_bits_enemy = 1 if self._bot_race == "P" else 0
+        self.unit_type_bits = map_params.unit_type_bits
+        self.map_type = map_params.map_type
 
         # Actions
         self.n_actions_no_attack = 6
         self.n_actions_move = 4
+        if self.map_type == 'bunker':
+            self.n_actions_no_attack += 2 # enter & leave bunker
+            self.bunker_enter_range = args.bunker_enter_range
+            self.bunker_open = 0
         self.n_actions = self.n_actions_no_attack + self.n_enemies
 
-        # Map info
-        self._agent_race = map_params["a_race"]
-        self._bot_race = map_params["b_race"]
-        self.shield_bits_ally = 1 if self._agent_race == "P" else 0
-        self.shield_bits_enemy = 1 if self._bot_race == "P" else 0
-        self.unit_type_bits = map_params["unit_type_bits"]
-        self.map_type = map_params["map_type"]
+        if sys.platform == 'linux':
+            os.environ['SC2PATH'] = os.path.join(os.getcwd(), "3rdparty", 'StarCraftII')
+            self.game_version = args.game_version
+        else:
+            # Can be derived automatically
+            self.game_version = "4.6.2"
 
-        self.max_reward = (
-            self.n_enemies * self.reward_death_value + self.reward_win
-        )
+        # Launch the game
+        self._launch()
 
-        self.agents = {}
-        self.enemies = {}
-        self._episode_count = 0
-        self._episode_steps = 0
-        self._total_steps = 0
-        self._obs = None
-        self.battles_won = 0
-        self.battles_game = 0
-        self.timeouts = 0
-        self.force_restarts = 0
-        self.last_stats = None
-        self.death_tracker_ally = np.zeros(self.n_agents)
-        self.death_tracker_enemy = np.zeros(self.n_enemies)
-        self.previous_ally_units = None
-        self.previous_enemy_units = None
-        self.last_action = np.zeros((self.n_agents, self.n_actions))
-        self._min_unit_type = 0
-        self.marine_id = self.marauder_id = self.medivac_id = 0
-        self.hydralisk_id = self.zergling_id = self.baneling_id = 0
-        self.stalker_id = self.colossus_id = self.zealot_id = 0
-        self.max_distance_x = 0
-        self.max_distance_y = 0
-        self.map_x = 0
-        self.map_y = 0
-        self.terrain_height = None
-        self.pathing_grid = None
-        self._run_config = None
-        self._sc2_proc = None
-        self._controller = None
-
-        # Try to avoid leaking SC2 processes on shutdown
-        atexit.register(lambda: self.close())
-
-    def get_feature_vector(self):
-        return self.feature_vector
-
-    def get_weight_vector(self):
-        return self.weight_vector
-
-    def generate_feature_vector(self):
-        feats = []
-        if not self.reward_only_positive:
-            for al_id in range(self.n_agents):
-                feats.append(("health_diff", "ally", al_id))
-                feats.append(("dead", "ally", al_id))
-        for e_id in range(self.n_enemies):
-            feats.append(("health_diff", "enemy", e_id))
-            feats.append(("dead", "enemy", e_id))
-        feats.append("win")
-        return feats
-
-    def generateWeightVector(self):
-        al_weights = []
-        en_weights = []
-
-        if not self.reward_only_positive:
-            for al_id, al_unit in self.agents.items():
-                scale_to_use = self.reward_negative_scale
-                health_scale = self.reward_negative_scale
-
-                al_weights.append(-1.0 * health_scale * (al_unit.health_max + al_unit.shield_max))
-                al_weights.append(-1.0 * self.reward_death_value * scale_to_use)
-
-        for e_id, e_unit in self.enemies.items():
-
-            scale_to_use = 1.0
-            health_scale = 1.0
-
-            en_weights.append(health_scale * (e_unit.health_max + e_unit.shield_max))
-            en_weights.append(scale_to_use * self.reward_death_value)
-
-        en_weights.append(self.reward_win)
-
-        return np.concatenate((np.array(al_weights), np.array(en_weights)), axis=0)
-
-    def _launch(self):
-        """Launch the StarCraft II game."""
-        self._run_config = run_configs.get(version=self.game_version)
-        _map = maps.get(self.map_name)
-
-        # Setting up the interface
-        interface_options = sc_pb.InterfaceOptions(raw=True, score=False)
-        self._sc2_proc = self._run_config.start(window_size=self.window_size, want_rgb=False)
-        self._controller = self._sc2_proc.controller
-
-        # Request to create the game
-        create = sc_pb.RequestCreateGame(
-            local_map=sc_pb.LocalMap(
-                map_path=_map.path,
-                map_data=self._run_config.map_data(_map.path)),
-            realtime=False,
-            random_seed=self._seed)
-        create.player_setup.add(type=sc_pb.Participant)
-        create.player_setup.add(type=sc_pb.Computer, race=races[self._bot_race],
-                                difficulty=difficulties[self.difficulty])
-        self._controller.create_game(create)
-
-        join = sc_pb.RequestJoinGame(race=races[self._agent_race],
-                                     options=interface_options)
-        self._controller.join_game(join)
-
-        game_info = self._controller.game_info()
-        map_info = game_info.start_raw
-        map_play_area_min = map_info.playable_area.p0
-        map_play_area_max = map_info.playable_area.p1
-        self.max_distance_x = map_play_area_max.x - map_play_area_min.x
-        self.max_distance_y = map_play_area_max.y - map_play_area_min.y
-        self.map_x = map_info.map_size.x
-        self.map_y = map_info.map_size.y
-
-        if map_info.pathing_grid.bits_per_pixel == 1:
-            vals = np.array(list(map_info.pathing_grid.data)).reshape(
+        self.max_reward = self.n_enemies * self.reward_death_value + self.reward_win
+        self._game_info = self.controller.game_info()
+        self._map_info = self._game_info.start_raw
+        self.map_x = self._map_info.map_size.x
+        self.map_y = self._map_info.map_size.y
+        self.map_play_area_min = self._map_info.playable_area.p0
+        self.map_play_area_max = self._map_info.playable_area.p1
+        self.max_distance_x = self.map_play_area_max.x - self.map_play_area_min.x
+        self.max_distance_y = self.map_play_area_max.y - self.map_play_area_min.y
+        self.terrain_height = np.flip(np.transpose(np.array(list(self._map_info.terrain_height.data)).reshape(self.map_x, self.map_y)), 1)
+        if self._map_info.pathing_grid.bits_per_pixel == 1:
+            vals = np.array(list(self._map_info.pathing_grid.data)).reshape(
                 self.map_x, int(self.map_y / 8))
             self.pathing_grid = np.transpose(np.array([
                 [(b >> i) & 1 for b in row for i in range(7, -1, -1)]
                 for row in vals], dtype=np.bool))
         else:
             self.pathing_grid = np.invert(np.flip(np.transpose(np.array(
-                list(map_info.pathing_grid.data), dtype=np.bool).reshape(
-                    self.map_x, self.map_y)), axis=1))
+                list(self._map_info.pathing_grid.data), dtype=np.bool).reshape(
+                    self.map_y, self.map_x)), axis=1))
 
-        self.terrain_height = np.flip(
-            np.transpose(np.array(list(map_info.terrain_height.data))
-                .reshape(self.map_x, self.map_y)), 1) / 255
+        #print(self.pathing_grid.shape)
+        #for x in self.pathing_grid:
+        #    string = ''
+        #    for y in x:
+        #        string += '+' if y else "-"
+        #    print(string)
+        #print(self.map_x)
+        #print(self.map_y)
+
+        if '2_corridors' in self.map_name:
+            self.pathing_grid_orig = deepcopy(self.pathing_grid)
+            self.corridor = 0
+
+        self._episode_count = 0
+        self._total_steps = 0
+
+        self.battles_won = 0
+        self.battles_game = 0
+        self.timeouts = 0
+        self.force_restarts = 0
+
+        self.last_stats = None
+
+        #print(" AGENT 0 ".center(60, '*'))
+        #print(self.controller.query(q_pb.RequestQuery(abilities=[q_pb.RequestQueryAvailableAbilities(unit_tag=self.agents[0].tag)])))
+        #print(" Info ".center(60, '*'))
+        #print(self.agents[1])
+        #print(" BUNKER ".center(60, '*'))
+        #print(self.bunker)
+        #print(self.controller.query(q_pb.RequestQuery(abilities=[q_pb.RequestQueryAvailableAbilities(unit_tag=self.bunker.tag)])))
+        #print(" RAW DATA ".center(60, '*'))
+        #print(self.controller.data_raw())
+        #sys.exit()
+
+    def init_ally_unit_types(self, min_unit_type):
+        # This should be called once from the init_units function
+
+        self.stalker_id = self.sentry_id = self.zealot_id = self.colossus_id = 0
+        self.marine_id = self.marauder_id= self.medivac_id = 0
+        self.hydralisk_id = self.zergling_id = self.baneling_id = 0
+
+        self.min_unit_type = min_unit_type
+
+        if self.map_type == 'sz' or self.map_type == 's_v_z':
+            self.stalker_id = min_unit_type
+            self.zealot_id = min_unit_type + 1
+        elif self.map_type == 'MMM':
+            self.marauder_id = min_unit_type
+            self.marine_id = min_unit_type + 1
+            self.medivac_id = min_unit_type + 2
+        elif self.map_type == 'zealots':
+            self.zealot_id = min_unit_type
+        elif self.map_type == 'focus_fire':
+            self.hydralisk_id = min_unit_type
+        elif self.map_type == 'retarget':
+            self.stalker_id = min_unit_type
+        elif self.map_type == 'colossus':
+            self.colossus_id = min_unit_type
+        elif self.map_type == 'ze_ba':
+            self.baneling_id = min_unit_type
+            self.zergling_id = min_unit_type + 1
+
+    def _launch(self):
+
+        self._run_config = run_configs.get()
+        self._map = maps.get(self.map_name)
+
+        # Setting up the interface
+        self.interface = sc_pb.InterfaceOptions(
+                raw = True, # raw, feature-level data
+                score = True)
+
+        self._sc2_proc = self._run_config.start(version=self.game_version, window_size=self.window_size)
+        self.controller = self._sc2_proc.controller
+
+        # Create the game.
+        create = sc_pb.RequestCreateGame(realtime = False,
+                random_seed = self.seed,
+                local_map=sc_pb.LocalMap(map_path=self._map.path, map_data=self._run_config.map_data(self._map.path)))
+        create.player_setup.add(type=sc_pb.Participant)
+        create.player_setup.add(type=sc_pb.Computer, race=races[self._bot_race],
+                                difficulty=difficulties[self.difficulty])
+        self.controller.create_game(create)
+
+        join = sc_pb.RequestJoinGame(race=races[self._agent_race], options=self.interface)
+        self.controller.join_game(join)
+
+    def save_replay(self):
+        prefix = self.save_replay_prefix or self.map_name
+        replay_path = self._run_config.save_replay(self.controller.save_replay(), replay_dir='', prefix=prefix)
+        print("Replay saved at: %s" % replay_path)
 
     def reset(self):
-        """Reset the environment. Required after each full episode.
-        Returns initial observations and states.
-        """
+        """Start a new episode."""
+
+        if self.debug_inputs or self.debug_rewards:
+            print('------------>> RESET <<------------')
+
         self._episode_steps = 0
-        if self._episode_count == 0:
-            # Launch StarCraft II
-            self._launch()
-        else:
+        if self._episode_count > 0:
+            # No need to restart for the first episode.
             self._restart()
+
+        self._episode_count += 1
+
+        if self.heuristic:
+            self.heuristic_targets = [0] * self.n_agents
 
         # Information kept for counting the reward
         self.death_tracker_ally = np.zeros(self.n_agents)
         self.death_tracker_enemy = np.zeros(self.n_enemies)
-        self.previous_ally_units = None
+        self.previous_agent_units = None
         self.previous_enemy_units = None
         self.win_counted = False
         self.defeat_counted = False
 
         self.last_action = np.zeros((self.n_agents, self.n_actions))
 
-        if self.heuristic_ai:
-            self.heuristic_targets = [None] * self.n_agents
-
         try:
-            self._obs = self._controller.observe()
+            self._obs = self.controller.observe()
             self.init_units()
-        except (protocol.ProtocolError, protocol.ConnectionError):
+        except protocol.ProtocolError:
             self.full_restart()
-
-        if self.debug:
-            logging.debug("Started Episode {}"
-                          .format(self._episode_count).center(60, "*"))
+        except protocol.ConnectionError:
+            self.full_restart()
 
         return self.get_obs(), self.get_state()
 
     def _restart(self):
-        """Restart the environment by killing all units on the map.
-        There is a trigger in the SC2Map file, which restarts the
-        episode when there are no units left.
-        """
+
+        # Kill and restore all units
         try:
-            self._kill_all_units()
-            self._controller.step(2)
-        except (protocol.ProtocolError, protocol.ConnectionError):
+            self.kill_all_units()
+            self.controller.step(2)
+        except protocol.ProtocolError:
+            self.full_restart()
+        except protocol.ConnectionError:
             self.full_restart()
 
     def full_restart(self):
-        """Full restart. Closes the SC2 process and launches a new one. """
+        # End episode and restart a new one
         self._sc2_proc.close()
         self._launch()
         self.force_restarts += 1
 
-    def step(self, actions):
-        """A single environment step. Returns reward, terminated, info."""
-        actions_int = [int(a) for a in actions]
+    def one_hot(self, data, nb_classes):
+        """Convert an iterable of indices to one-hot encoded labels."""
+        targets = np.array(data).reshape(-1)
+        return np.eye(nb_classes)[targets]
 
-        self.last_action = np.eye(self.n_actions)[np.array(actions_int)]
+    def step(self, actions):
+
+        actions = [int(a) for a in actions]
+
+        self.last_action = self.one_hot(actions, self.n_actions)
 
         # Collect individual actions
         sc_actions = []
-        if self.debug:
-            logging.debug("Actions".center(60, "-"))
-
-        for a_id, action in enumerate(actions_int):
-            if not self.heuristic_ai:
-                sc_action = self.get_agent_action(a_id, action)
+        for a_id, action in enumerate(actions):
+            if not self.heuristic:
+                agent_action = self.get_agent_action(a_id, action)
             else:
-                sc_action, action_num = self.get_agent_action_heuristic(
-                    a_id, action)
-                actions[a_id] = action_num
-            if sc_action:
-                sc_actions.append(sc_action)
-
+                agent_action = self.get_agent_action_heuristic(a_id, action)
+            if agent_action:
+              sc_actions.append(agent_action)
         # Send action request
         req_actions = sc_pb.RequestAction(actions=sc_actions)
+
         try:
-            self._controller.actions(req_actions)
+            res_actions = self.controller.actions(req_actions)
             # Make step in SC2, i.e. apply actions
-            self._controller.step(self._step_mul)
+            self.controller.step(self._step_mul)
             # Observe here so that we know if the episode is over.
-            self._obs = self._controller.observe()
-        except (protocol.ProtocolError, protocol.ConnectionError):
+            self._obs = self.controller.observe()
+        except protocol.ProtocolError:
             self.full_restart()
-            return 0, np.zeros(self.weight_vector.shape), True, {}
+            return 0, True, {}
+        except protocol.ConnectionError:
+            self.full_restart()
+            return 0, True, {}
 
         self._total_steps += 1
         self._episode_steps += 1
 
-        # Update units
-        game_end_code = self.update_units()
+        # Update what we know about units
+        end_game = self.update_units()
 
         terminated = False
-        reward, step_feature = self.reward_battle()
+        reward = self.reward_battle()
         info = {"battle_won": False}
 
-        # count units that are still alive
-        dead_allies, dead_enemies = 0, 0
-        for al_id, al_unit in self.agents.items():
-            if al_unit.health == 0:
-                dead_allies += 1
-        for e_id, e_unit in self.enemies.items():
-            if e_unit.health == 0:
-                dead_enemies += 1
+        if self.map_type == '2step':
+            dead_zealots = [unit.tag for _, unit in self.enemies.items() if unit.unit_type == 73 and unit.health == 0]
+            if len(dead_zealots) > 0:
+                end_game = 1
+                tag = dead_zealots[0]
+                index = self.zealot_tags.index(tag)
+                if index == 0:
+                    reward += self.reward_win
 
-        info['dead_allies'] = dead_allies
-        info['dead_enemies'] = dead_enemies
+        elif self.map_type == '3step':
+            if self.map_name == '3step' and self.agents[0].pos.y < 20 and self.agents[1].pos.y < 20:
+                end_game = 1
+                x1 = self.agents[0].pos.x
+                x2 = self.agents[1].pos.x
 
-        if game_end_code is not None:
+                if 21 < x1 < 34 and 21 < x2 < 34:
+                    reward += 0.2 * self.max_reward
+
+            if self.map_name == '4step' and self.agents[0].pos.y < 11 and self.agents[1].pos.y < 11:
+                end_game = 1
+                x1 = self.agents[0].pos.x
+                x2 = self.agents[1].pos.x
+
+                if 20 < x1 < 28 and 20 < x2 < 28:
+                    reward += 0.2 * self.max_reward
+
+        if end_game is not None:
             # Battle is over
             terminated = True
             self.battles_game += 1
-            if game_end_code == 1 and not self.win_counted:
+            if end_game == 1 and not self.win_counted:
                 self.battles_won += 1
                 self.win_counted = True
                 info["battle_won"] = True
-                step_feature[-1] = 1.0
                 if not self.reward_sparse:
                     reward += self.reward_win
                 else:
                     reward = 1
-            elif game_end_code == -1 and not self.defeat_counted:
+
+            elif end_game == -1 and not self.defeat_counted:
                 self.defeat_counted = True
                 if not self.reward_sparse:
                     reward += self.reward_defeat
                 else:
                     reward = -1
 
-        elif self._episode_steps >= self.episode_limit:
+        elif self.episode_limit > 0 and self._episode_steps >= self.episode_limit:
             # Episode limit reached
             terminated = True
             if self.continuing_episode:
@@ -515,223 +408,142 @@ class StarCraft2Env(MultiAgentEnv):
             self.battles_game += 1
             self.timeouts += 1
 
-        if self.debug:
-            logging.debug("Reward = {}".format(reward).center(60, '-'))
-
-        if terminated:
-            self._episode_count += 1
+        if self.debug_inputs or self.debug_rewards:
+            print("Total Reward = %.f \n ---------------------" % reward)
 
         if self.reward_scale:
-            reward /= self.max_reward / self.reward_scale_rate
+            reward /= (self.max_reward / self.reward_scale_rate)
 
-        assert abs(np.dot(step_feature, self.weight_vector) - reward) < 1e-5, print(
-            np.dot(step_feature, self.weight_vector), reward)
-
-        return reward, step_feature, terminated, info
+        return reward, terminated, info
 
     def get_agent_action(self, a_id, action):
-        """Construct the action for agent a_id."""
-        avail_actions = self.get_avail_agent_actions(a_id)
-        assert avail_actions[action] == 1, \
-                "Agent {} cannot perform action {}".format(a_id, action)
 
         unit = self.get_unit_by_id(a_id)
         tag = unit.tag
         x = unit.pos.x
         y = unit.pos.y
 
+        true_avail_actions = self.get_avail_agent_actions(a_id)
+        if true_avail_actions[action] == 0:
+            action = 1
+
         if action == 0:
             # no-op (valid only when dead)
-            assert unit.health == 0, "No-op only available for dead agents."
-            if self.debug:
-                logging.debug("Agent {}: Dead".format(a_id))
+            assert unit.health == 0, "No-op chosen but the agent's unit is not dead"
+            if self.debug_inputs:
+                print("Agent %d: Dead"% a_id)
             return None
         elif action == 1:
             # stop
-            cmd = r_pb.ActionRawUnitCommand(
-                ability_id=actions["stop"],
-                unit_tags=[tag],
-                queue_command=False)
-            if self.debug:
-                logging.debug("Agent {}: Stop".format(a_id))
+            cmd = r_pb.ActionRawUnitCommand(ability_id = action_stop_id,
+                    unit_tags = [tag],
+                    queue_command = False)
+            if self.debug_inputs:
+                print("Agent %d: Stop"% a_id)
 
         elif action == 2:
-            # move north
-            cmd = r_pb.ActionRawUnitCommand(
-                ability_id=actions["move"],
-                target_world_space_pos=sc_common.Point2D(
-                    x=x, y=y + self._move_amount),
-                unit_tags=[tag],
-                queue_command=False)
-            if self.debug:
-                logging.debug("Agent {}: Move North".format(a_id))
+            # north
+            cmd = r_pb.ActionRawUnitCommand(ability_id = action_move_id,
+                    target_world_space_pos = sc_common.Point2D(x = x, y = y + self._move_amount),
+                    unit_tags = [tag],
+                    queue_command = False)
+            if self.debug_inputs:
+                print("Agent %d: North"% a_id)
 
         elif action == 3:
-            # move south
-            cmd = r_pb.ActionRawUnitCommand(
-                ability_id=actions["move"],
-                target_world_space_pos=sc_common.Point2D(
-                    x=x, y=y - self._move_amount),
-                unit_tags=[tag],
-                queue_command=False)
-            if self.debug:
-                logging.debug("Agent {}: Move South".format(a_id))
+            # south
+            cmd = r_pb.ActionRawUnitCommand(ability_id = action_move_id,
+                    target_world_space_pos = sc_common.Point2D(x = x, y = y - self._move_amount),
+                    unit_tags = [tag],
+                    queue_command = False)
+            if self.debug_inputs:
+                print("Agent %d: South"% a_id)
 
         elif action == 4:
-            # move east
-            cmd = r_pb.ActionRawUnitCommand(
-                ability_id=actions["move"],
-                target_world_space_pos=sc_common.Point2D(
-                    x=x + self._move_amount, y=y),
-                unit_tags=[tag],
-                queue_command=False)
-            if self.debug:
-                logging.debug("Agent {}: Move East".format(a_id))
+            # east
+            cmd = r_pb.ActionRawUnitCommand(ability_id = action_move_id,
+                    target_world_space_pos = sc_common.Point2D(x = x + self._move_amount, y = y),
+                    unit_tags = [tag],
+                    queue_command = False)
+            if self.debug_inputs:
+                print("Agent %d: East"% a_id)
 
         elif action == 5:
-            # move west
-            cmd = r_pb.ActionRawUnitCommand(
-                ability_id=actions["move"],
-                target_world_space_pos=sc_common.Point2D(
-                    x=x - self._move_amount, y=y),
-                unit_tags=[tag],
-                queue_command=False)
-            if self.debug:
-                logging.debug("Agent {}: Move West".format(a_id))
+            # west
+            cmd = r_pb.ActionRawUnitCommand(ability_id = action_move_id,
+                    target_world_space_pos = sc_common.Point2D(x = x - self._move_amount, y = y),
+                    unit_tags = [tag],
+                    queue_command = False)
+            if self.debug_inputs:
+                print("Agent %d: West"% a_id)
+
+        elif self.map_type == 'bunker' and action == 6:
+            # enter bunker
+            cmd = r_pb.ActionRawUnitCommand(ability_id = action_enter_bunker_id,
+                target_unit_tag = tag,
+                unit_tags = [self.bunker.tag],
+                queue_command = False)
+            if self.debug_inputs:
+                print("Agent %d: Enter Bunker" % a_id)
+
+        elif self.map_type == 'bunker' and action == 7:
+            # leave bunker
+            cmd = r_pb.ActionRawUnitCommand(ability_id = action_leave_bunker_id,
+                unit_tags = [self.bunker.tag],
+                queue_command = False)
+            if self.debug_inputs:
+                print("Agent %d: Leave Bunker" % a_id)
         else:
             # attack/heal units that are in range
             target_id = action - self.n_actions_no_attack
-            if self.map_type == "MMM" and unit.unit_type == self.medivac_id:
+            if self.map_type == 'MMM' and unit.unit_type == self.medivac_id:
                 target_unit = self.agents[target_id]
-                action_name = "heal"
+                action_id = action_heal_id
+            elif self.map_type == 'bunker' and tag == self.bunker_chief:
+                # choose buner as tag
+                tag = self.bunker.tag
+                target_unit = self.enemies[target_id]
+                action_id = action_attack_bunker_id
             else:
                 target_unit = self.enemies[target_id]
-                action_name = "attack"
-
-            action_id = actions[action_name]
+                action_id = action_attack_id
             target_tag = target_unit.tag
 
-            cmd = r_pb.ActionRawUnitCommand(
-                ability_id=action_id,
-                target_unit_tag=target_tag,
-                unit_tags=[tag],
-                queue_command=False)
+            cmd = r_pb.ActionRawUnitCommand(ability_id = action_id,
+                    target_unit_tag = target_tag,
+                    unit_tags = [tag],
+                    queue_command = False)
 
-            if self.debug:
-                logging.debug("Agent {} {}s unit # {}".format(
-                    a_id, action_name, target_id))
+            if self.debug_inputs:
+                print("Agent %d attacks enemy # %d" % (a_id, target_id))
 
         sc_action = sc_pb.Action(action_raw=r_pb.ActionRaw(unit_command=cmd))
         return sc_action
 
     def get_agent_action_heuristic(self, a_id, action):
+
         unit = self.get_unit_by_id(a_id)
         tag = unit.tag
 
-        target = self.heuristic_targets[a_id]
-        if unit.unit_type == self.medivac_id:
-            if (target is None or self.agents[target].health == 0 or
-                self.agents[target].health == self.agents[target].health_max):
-                min_dist = math.hypot(self.max_distance_x, self.max_distance_y)
-                min_id = -1
-                for al_id, al_unit in self.agents.items():
-                    if al_unit.unit_type == self.medivac_id:
-                        continue
-                    if (al_unit.health != 0 and
-                        al_unit.health != al_unit.health_max):
-                        dist = self.distance(unit.pos.x, unit.pos.y,
-                                             al_unit.pos.x, al_unit.pos.y)
-                        if dist < min_dist:
-                            min_dist = dist
-                            min_id = al_id
-                self.heuristic_targets[a_id] = min_id
-                if min_id == -1:
-                    self.heuristic_targets[a_id] = None
-                    return None, 0
-            action_id = actions['heal']
-            target_tag = self.agents[self.heuristic_targets[a_id]].tag
-        else:
-            if target is None or self.enemies[target].health == 0:
-                min_dist = math.hypot(self.max_distance_x, self.max_distance_y)
-                min_id = -1
-                for e_id, e_unit in self.enemies.items():
-                    if (unit.unit_type == self.marauder_id and
-                        e_unit.unit_type == self.medivac_id):
-                        continue
-                    if e_unit.health > 0:
-                        dist = self.distance(unit.pos.x, unit.pos.y,
-                                             e_unit.pos.x, e_unit.pos.y)
-                        if dist < min_dist:
-                            min_dist = dist
-                            min_id = e_id
-                self.heuristic_targets[a_id] = min_id
-                if min_id == -1:
-                    self.heuristic_targets[a_id] = None
-                    return None, 0
-            action_id = actions['attack']
-            target_tag = self.enemies[self.heuristic_targets[a_id]].tag
+        target_tag = self.enemies[self.heuristic_targets[a_id]].tag
+        action_id = action_attack_id
 
-        action_num = self.heuristic_targets[a_id] + self.n_actions_no_attack
-
-        # Check if the action is available
-        if (self.heuristic_rest and
-            self.get_avail_agent_actions(a_id)[action_num] == 0):
-
-            # Move towards the target rather than attacking/healing
-            if unit.unit_type == self.medivac_id:
-                target_unit = self.agents[self.heuristic_targets[a_id]]
-            else:
-                target_unit = self.enemies[self.heuristic_targets[a_id]]
-
-            delta_x = target_unit.pos.x - unit.pos.x
-            delta_y = target_unit.pos.y - unit.pos.y
-
-            if abs(delta_x) > abs(delta_y): # east or west
-                if delta_x > 0: # east
-                    target_pos=sc_common.Point2D(
-                        x=unit.pos.x + self._move_amount, y=unit.pos.y)
-                    action_num = 4
-                else: # west
-                    target_pos=sc_common.Point2D(
-                        x=unit.pos.x - self._move_amount, y=unit.pos.y)
-                    action_num = 5
-            else: # north or south
-                if delta_y > 0: # north
-                    target_pos=sc_common.Point2D(
-                        x=unit.pos.x, y=unit.pos.y + self._move_amount)
-                    action_num = 2
-                else: # south
-                    target_pos=sc_common.Point2D(
-                        x=unit.pos.x, y=unit.pos.y - self._move_amount)
-                    action_num = 3
-
-            cmd = r_pb.ActionRawUnitCommand(
-                ability_id = actions['move'],
-                target_world_space_pos = target_pos,
-                unit_tags = [tag],
-                queue_command = False)
-        else:
-            # Attack/heal the target
-            cmd = r_pb.ActionRawUnitCommand(
-                ability_id = action_id,
+        cmd = r_pb.ActionRawUnitCommand(ability_id = action_id,
                 target_unit_tag = target_tag,
                 unit_tags = [tag],
                 queue_command = False)
 
         sc_action = sc_pb.Action(action_raw=r_pb.ActionRaw(unit_command=cmd))
-        return sc_action, action_num
+        return sc_action
 
     def reward_battle(self):
-        """Reward function when self.reward_spare==False.
-        Returns accumulative hit/shield point damage dealt to the enemy
-        + reward_death_value per enemy unit killed, and, in case
-        self.reward_only_positive == False, - (damage dealt to ally units
-        + reward_death_value per ally unit killed) * self.reward_negative_scale
-        """
-        step_feature = np.zeros(shape=self.weight_vector.shape)
 
         if self.reward_sparse:
-            return 0, step_feature
+            return 0
+
+        #  delta health - delta enemies + delta deaths where value:
+        #   if enemy unit dies, add reward_death_value per dead unit
+        #   if own unit dies, subtract reward_death_value per dead unit
 
         reward = 0
         delta_deaths = 0
@@ -740,133 +552,125 @@ class StarCraft2Env(MultiAgentEnv):
 
         neg_scale = self.reward_negative_scale
 
+        if self.debug_rewards:
+            for al_id in range(self.n_agents):
+                print("Agent %d: diff HP = %.f, diff shield = %.f" % (al_id, self.previous_agent_units[al_id].health - self.agents[al_id].health, self.previous_agent_units[al_id].shield - self.agents[al_id].shield))
+            print('---------------------')
+            for al_id in range(self.n_enemies):
+                print("Enemy %d: diff HP = %.f, diff shield = %.f" % (al_id, self.previous_enemy_units[al_id].health - self.enemies[al_id].health, self.previous_enemy_units[al_id].shield - self.enemies[al_id].shield))
+
         # update deaths
         for al_id, al_unit in self.agents.items():
             if not self.death_tracker_ally[al_id]:
                 # did not die so far
-                prev_health = (
-                    self.previous_ally_units[al_id].health
-                    + self.previous_ally_units[al_id].shield
-                )
-
-                if not self.reward_only_positive:
-                    health_diff_feature_index = self.feature_vector.index(("health_diff", "ally", al_id))
-                    dead_feature_index = self.feature_vector.index(("dead", "ally", al_id))
-
+                prev_health = self.previous_agent_units[al_id].health + self.previous_agent_units[al_id].shield
                 if al_unit.health == 0:
                     # just died
                     self.death_tracker_ally[al_id] = 1
                     if not self.reward_only_positive:
                         delta_deaths -= self.reward_death_value * neg_scale
                     delta_ally += prev_health * neg_scale
-
-                    if not self.reward_only_positive:
-                        step_feature[health_diff_feature_index] = prev_health / (al_unit.health_max + al_unit.shield_max)
-                        step_feature[dead_feature_index] = 1.0
                 else:
                     # still alive
-                    delta_ally += neg_scale * (
-                        prev_health - al_unit.health - al_unit.shield
-                    )
-
-                    if not self.reward_only_positive:
-                        step_feature[health_diff_feature_index] = (prev_health - al_unit.health - al_unit.shield) / (
-                                al_unit.health_max + al_unit.shield_max)
-
-                        step_feature[dead_feature_index] = 0.0
+                    delta_ally += (prev_health - al_unit.health - al_unit.shield) * neg_scale
 
         for e_id, e_unit in self.enemies.items():
             if not self.death_tracker_enemy[e_id]:
-                prev_health = (
-                    self.previous_enemy_units[e_id].health
-                    + self.previous_enemy_units[e_id].shield
-                )
-
-                health_diff_feature_index = self.feature_vector.index(("health_diff", "enemy", e_id))
-                dead_feature_index = self.feature_vector.index(("dead", "enemy", e_id))
-
+                prev_health = self.previous_enemy_units[e_id].health + self.previous_enemy_units[e_id].shield
                 if e_unit.health == 0:
                     self.death_tracker_enemy[e_id] = 1
                     delta_deaths += self.reward_death_value
                     delta_enemy += prev_health
-
-                    step_feature[health_diff_feature_index] = prev_health / (e_unit.health_max + e_unit.shield_max)
-                    step_feature[dead_feature_index] = 1.0
                 else:
                     delta_enemy += prev_health - e_unit.health - e_unit.shield
 
-                    step_feature[health_diff_feature_index] = (prev_health - e_unit.health - e_unit.shield) \
-                                                              / (e_unit.health_max + e_unit.shield_max)
-
-                    step_feature[dead_feature_index] = 0.0
-
         if self.reward_only_positive:
-            reward = abs(delta_enemy + delta_deaths)  # shield regeneration
+
+            if self.debug_rewards:
+                print("--------------------------")
+                print("Delta enemy: ", delta_enemy)
+                print("Delta deaths: ", delta_deaths)
+                print("Reward: ", delta_enemy + delta_deaths)
+                print("--------------------------")
+
+            reward = delta_enemy + delta_deaths
+            reward = abs(reward) # shield regeration
         else:
+            if self.debug_rewards:
+                print("--------------------------")
+                print("Delta enemy: ", delta_enemy)
+                print("Delta deaths: ", delta_deaths)
+                print("Delta ally: ", - delta_ally)
+                print("Reward: ", delta_enemy + delta_deaths)
+                print("--------------------------")
+
             reward = delta_enemy + delta_deaths - delta_ally
 
-        return reward, step_feature
+        return reward
 
     def get_total_actions(self):
-        """Returns the total number of actions an agent could ever take."""
         return self.n_actions
 
-    @staticmethod
-    def distance(x1, y1, x2, y2):
-        """Distance between two points."""
+    def distance(self, x1, y1, x2, y2):
         return math.hypot(x2 - x1, y2 - y1)
 
     def unit_shoot_range(self, agent_id):
-        """Returns the shooting range for an agent."""
         return 6
 
     def unit_sight_range(self, agent_id):
-        """Returns the sight range for an agent."""
         return 9
 
-    def unit_max_cooldown(self, unit):
-        """Returns the maximal cooldown for a unit."""
-        switcher = {
-            self.marine_id: 15,
-            self.marauder_id: 25,
-            self.medivac_id: 200,  # max energy
-            self.stalker_id: 35,
-            self.zealot_id: 22,
-            self.colossus_id: 24,
-            self.hydralisk_id: 10,
-            self.zergling_id: 11,
-            self.baneling_id: 1
-        }
-        return switcher.get(unit.unit_type, 15)
+    def unit_max_cooldown(self, agent_id):
 
-    def save_replay(self):
-        """Save a replay."""
-        prefix = self.replay_prefix or self.map_name
-        replay_dir = self.replay_dir or ""
-        replay_path = self._run_config.save_replay(
-            self._controller.save_replay(), replay_dir=replay_dir, prefix=prefix)
-        logging.info("Replay saved at: %s" % replay_path)
+        if self.map_type in ['marines', 'bunker', '2step', '3step']:
+            return 15
+
+        unit = self.get_unit_by_id(agent_id)
+        if unit.unit_type == self.marine_id:
+            return 15
+        if unit.unit_type == self.marauder_id:
+            return 25
+        if unit.unit_type == self.medivac_id:
+            return 200
+
+        if unit.unit_type == self.stalker_id:
+            return 35
+        if unit.unit_type == self.zealot_id:
+            return 22
+        if unit.unit_type == self.colossus_id:
+            return 24
+        if unit.unit_type == self.sentry_id:
+            return 13
+        if unit.unit_type == self.hydralisk_id:
+            return 10
+        if unit.unit_type == self.zergling_id:
+            return 11
+        if unit.unit_type == self.baneling_id:
+            return 1
 
     def unit_max_shield(self, unit):
-        """Returns maximal shield for a given unit."""
-        if unit.unit_type == 74 or unit.unit_type == self.stalker_id:
-            return 80  # Protoss's Stalker
-        if unit.unit_type == 73 or unit.unit_type == self.zealot_id:
-            return 50  # Protoss's Zaelot
-        if unit.unit_type == 4 or unit.unit_type == self.colossus_id:
-            return 150  # Protoss's Colossus
+
+        if unit.unit_type == 74 or unit.unit_type == self.stalker_id: # Protoss's Stalker
+            return 80
+        if unit.unit_type == 73 or unit.unit_type == self.zealot_id: # Protoss's Zaelot
+            return 50
+        if unit.unit_type == 77 or unit.unit_type == self.sentry_id: # Protoss's Sentry
+            return 40
+        if unit.unit_type == 4 or unit.unit_type == self.colossus_id: # Protoss's Colossus
+            return 150
+        return 1
 
     def can_move(self, unit, direction):
-        """Whether a unit can move in a given direction."""
+
         m = self._move_amount / 2
 
-        if direction == Direction.NORTH:
+        if direction == 0: # north
             x, y = int(unit.pos.x), int(unit.pos.y + m)
-        elif direction == Direction.SOUTH:
+        elif direction == 1: # south
             x, y = int(unit.pos.x), int(unit.pos.y - m)
-        elif direction == Direction.EAST:
+        elif direction == 2: # east
             x, y = int(unit.pos.x + m), int(unit.pos.y)
-        else:
+        else : # west
             x, y = int(unit.pos.x - m), int(unit.pos.y)
 
         if self.check_bounds(x, y) and self.pathing_grid[x, y]:
@@ -874,22 +678,32 @@ class StarCraft2Env(MultiAgentEnv):
 
         return False
 
+    def circle_grid_coords(self, unit, radius):
+        # Generates coordinates in grid that lie within a circle
+
+        r = radius
+        x_floor = int(unit.pos.x)
+        y_floor = int(unit.pos.y)
+
+        points = []
+        for x in range(-r, r + 1):
+            Y = int(math.sqrt(abs(r*r-x*x))) # bound for y given x
+            for y in range(- Y, + Y + 1):
+                points.append((x_floor + x, y_floor + y))
+        return points
+
     def get_surrounding_points(self, unit, include_self=False):
-        """Returns the surrounding points of the unit in 8 directions."""
+
         x = int(unit.pos.x)
         y = int(unit.pos.y)
 
         ma = self._move_amount
 
         points = [
-            (x, y + 2 * ma),
-            (x, y - 2 * ma),
-            (x + 2 * ma, y),
-            (x - 2 * ma, y),
-            (x + ma, y + ma),
-            (x - ma, y - ma),
-            (x + ma, y - ma),
-            (x - ma, y + ma),
+            (x, y + 2 * ma), (x, y - 2 * ma),
+            (x + 2 * ma, y), (x - 2 * ma, y),
+            (x + ma, y + ma), (x - ma, y - ma),
+            (x + ma, y - ma), (x - ma, y + ma)
         ]
 
         if include_self:
@@ -898,65 +712,54 @@ class StarCraft2Env(MultiAgentEnv):
         return points
 
     def check_bounds(self, x, y):
-        """Whether a point is within the map bounds."""
-        return (0 <= x < self.map_x and 0 <= y < self.map_y)
+        return x >= 0 and y >=0 and x < self.map_x and y < self.map_y
 
     def get_surrounding_pathing(self, unit):
-        """Returns pathing values of the grid surrounding the given unit."""
+
         points = self.get_surrounding_points(unit, include_self=False)
-        vals = [
-            self.pathing_grid[x, y] if self.check_bounds(x, y) else 1
-            for x, y in points
-        ]
+        vals = [self.pathing_grid[x, y] / 255 if self.check_bounds(x, y) else 1 for x, y in points]
         return vals
 
     def get_surrounding_height(self, unit):
-        """Returns height values of the grid surrounding the given unit."""
+
         points = self.get_surrounding_points(unit, include_self=True)
-        vals = [
-            self.terrain_height[x, y] if self.check_bounds(x, y) else 1
-            for x, y in points
-        ]
+        vals = [self.terrain_height[x, y] / 255 if self.check_bounds(x, y) else 1 for x, y in points]
         return vals
 
     def get_obs_agent(self, agent_id):
-        """Returns observation for agent_id. The observation is composed of:
 
-           - agent movement features (where it can move to, height information and pathing grid)
-           - enemy features (available_to_attack, health, relative_x, relative_y, shield, unit_type)
-           - ally features (visible, distance, relative_x, relative_y, shield, unit_type)
-           - agent unit features (health, shield, unit_type)
-
-           All of this information is flattened and concatenated into a list,
-           in the aforementioned order. To know the sizes of each of the
-           features inside the final list of features, take a look at the
-           functions ``get_obs_move_feats_size()``,
-           ``get_obs_enemy_feats_size()``, ``get_obs_ally_feats_size()`` and
-           ``get_obs_own_feats_size()``.
-
-           The size of the observation vector may vary, depending on the
-           environment configuration and type of units present in the map.
-           For instance, non-Protoss units will not have shields, movement
-           features may or may not include terrain height and pathing grid,
-           unit_type is not included if there is only one type of unit in the
-           map etc.).
-
-           NOTE: Agents should have access only to their local observations
-           during decentralised execution.
-        """
         unit = self.get_unit_by_id(agent_id)
 
-        move_feats_dim = self.get_obs_move_feats_size()
-        enemy_feats_dim = self.get_obs_enemy_feats_size()
-        ally_feats_dim = self.get_obs_ally_feats_size()
-        own_feats_dim = self.get_obs_own_feats_size()
+        nf_al = 4 + self.unit_type_bits
+        nf_en = 4 + self.unit_type_bits
 
-        move_feats = np.zeros(move_feats_dim, dtype=np.float32)
-        enemy_feats = np.zeros(enemy_feats_dim, dtype=np.float32)
-        ally_feats = np.zeros(ally_feats_dim, dtype=np.float32)
-        own_feats = np.zeros(own_feats_dim, dtype=np.float32)
+        if self.obs_all_health:
+            nf_al += 1 + self.shield_bits_ally
+            nf_en += 1 + self.shield_bits_enemy
 
-        if unit.health > 0:  # otherwise dead, return all zeros
+        if self.obs_last_action:
+            nf_al += self.n_actions
+
+        nf_own = self.unit_type_bits
+        if self.obs_own_health:
+            nf_own += 1 + self.shield_bits_ally
+        if self.map_type == 'bunker':
+            nf_own += 7 # accessible + location + location(3 bits) + inside + chief
+
+        move_feats_len = self.n_actions_move
+        if self.obs_pathing_grid:
+            move_feats_len += self.n_obs_pathing
+        if self.obs_terrain_height:
+            move_feats_len += self.n_obs_height
+        if '2_corridors' in self.map_name:
+            move_feats_len += 1
+
+        move_feats = np.zeros(move_feats_len, dtype=np.float32) # exclude no-op & stop
+        enemy_feats = np.zeros((self.n_enemies, nf_en), dtype=np.float32)
+        ally_feats = np.zeros((self.n_agents - 1, nf_al), dtype=np.float32)
+        own_feats = np.zeros(nf_own, dtype=np.float32)
+
+        if unit.health > 0: # otherwise dead, return all zeros
             x = unit.pos.x
             y = unit.pos.y
             sight_range = self.unit_sight_range(agent_id)
@@ -969,13 +772,14 @@ class StarCraft2Env(MultiAgentEnv):
             ind = self.n_actions_move
 
             if self.obs_pathing_grid:
-                move_feats[
-                    ind : ind + self.n_obs_pathing
-                ] = self.get_surrounding_pathing(unit)
+                move_feats[ind: ind + self.n_obs_pathing] = self.get_surrounding_pathing(unit)
                 ind += self.n_obs_pathing
 
             if self.obs_terrain_height:
                 move_feats[ind:] = self.get_surrounding_height(unit)
+
+            if '2_corridors' in self.map_name:
+                move_feats[-1] = self.corridor
 
             # Enemy features
             for e_id, e_unit in self.enemies.items():
@@ -983,68 +787,54 @@ class StarCraft2Env(MultiAgentEnv):
                 e_y = e_unit.pos.y
                 dist = self.distance(x, y, e_x, e_y)
 
-                if (
-                    dist < sight_range and e_unit.health > 0
-                ):  # visible and alive
+                if dist < sight_range and e_unit.health > 0: # visible and alive
                     # Sight range > shoot range
-                    enemy_feats[e_id, 0] = avail_actions[
-                        self.n_actions_no_attack + e_id
-                    ]  # available
-                    enemy_feats[e_id, 1] = dist / sight_range  # distance
-                    enemy_feats[e_id, 2] = (
-                        e_x - x
-                    ) / sight_range  # relative X
-                    enemy_feats[e_id, 3] = (
-                        e_y - y
-                    ) / sight_range  # relative Y
+                    enemy_feats[e_id, 0] = avail_actions[self.n_actions_no_attack + e_id] # available
+                    enemy_feats[e_id, 1] = dist / sight_range # distance
+                    enemy_feats[e_id, 2] = (e_x - x) / sight_range # relative X
+                    enemy_feats[e_id, 3] = (e_y - y) / sight_range # relative Y
 
                     ind = 4
                     if self.obs_all_health:
-                        enemy_feats[e_id, ind] = (
-                            e_unit.health / e_unit.health_max
-                        )  # health
+                        enemy_feats[e_id, ind] = e_unit.health / e_unit.health_max # health
                         ind += 1
                         if self.shield_bits_enemy > 0:
                             max_shield = self.unit_max_shield(e_unit)
-                            enemy_feats[e_id, ind] = (
-                                e_unit.shield / max_shield
-                            )  # shield
+                            enemy_feats[e_id, ind] = e_unit.shield / max_shield # shield
                             ind += 1
 
                     if self.unit_type_bits > 0:
                         type_id = self.get_unit_type_id(e_unit, False)
-                        enemy_feats[e_id, ind + type_id] = 1  # unit type
+                        enemy_feats[e_id, ind + type_id] = 1 # unit type
 
             # Ally features
-            al_ids = [
-                al_id for al_id in range(self.n_agents) if al_id != agent_id
-            ]
+            al_ids = [al_id for al_id in range(self.n_agents) if al_id != agent_id]
             for i, al_id in enumerate(al_ids):
+
+                # if unit is not in bunker but the ally is
+                if (self.map_type == 'bunker' and
+                    unit.tag not in self.bunker_passengers and
+                    al_id in self.bunker_passengers):
+                    continue # can't see
 
                 al_unit = self.get_unit_by_id(al_id)
                 al_x = al_unit.pos.x
                 al_y = al_unit.pos.y
                 dist = self.distance(x, y, al_x, al_y)
 
-                if (
-                    dist < sight_range and al_unit.health > 0
-                ):  # visible and alive
-                    ally_feats[i, 0] = 1  # visible
-                    ally_feats[i, 1] = dist / sight_range  # distance
-                    ally_feats[i, 2] = (al_x - x) / sight_range  # relative X
-                    ally_feats[i, 3] = (al_y - y) / sight_range  # relative Y
+                if dist < sight_range and al_unit.health > 0: # visible and alive
+                    ally_feats[i, 0] = 1 # visible
+                    ally_feats[i, 1] = dist / sight_range # distance
+                    ally_feats[i, 2] = (al_x - x) / sight_range # relative X
+                    ally_feats[i, 3] = (al_y - y) / sight_range # relative Y
 
                     ind = 4
                     if self.obs_all_health:
-                        ally_feats[i, ind] = (
-                            al_unit.health / al_unit.health_max
-                        )  # health
+                        ally_feats[i, ind] = al_unit.health / al_unit.health_max # health
                         ind += 1
                         if self.shield_bits_ally > 0:
                             max_shield = self.unit_max_shield(al_unit)
-                            ally_feats[i, ind] = (
-                                al_unit.shield / max_shield
-                            )  # shield
+                            ally_feats[i, ind] = al_unit.shield / max_shield # shield
                             ind += 1
 
                     if self.unit_type_bits > 0:
@@ -1068,47 +858,53 @@ class StarCraft2Env(MultiAgentEnv):
             if self.unit_type_bits > 0:
                 type_id = self.get_unit_type_id(unit, True)
                 own_feats[ind + type_id] = 1
+                ind += self.unit_type_bits
 
-        agent_obs = np.concatenate(
-            (
-                move_feats.flatten(),
-                enemy_feats.flatten(),
-                ally_feats.flatten(),
-                own_feats.flatten(),
-            )
-        )
+            # For Bunker map
+            if self.map_type == 'bunker' and self.bunker_open == 1:
+                own_feats[ind] = avail_actions[6] # accessibility
+                b_x = self.bunker.pos.x
+                b_y = self.bunker.pos.y
+                if own_feats[ind] == 1:
+                    # Not in the bunker and can see it
+                    own_feats[ind + 1] = self.bunker.health / self.bunker.health_max
+                    dist = self.distance(x, y, b_x, b_y)
+                    own_feats[ind + 2] = dist / sight_range
+                    own_feats[ind + 3] = (b_x - x) / sight_range
+                    own_feats[ind + 4] = (b_y - y) / sight_range
+                elif unit.tag in self.bunker_passengers:
+                    # inside the bunker
+                    own_feats[ind + 1] = self.bunker.health / self.bunker.health_max
+                    own_feats[ind + 5] = 1
+                    if unit.tag == self.bunker_chief:
+                        # inside and cheaf
+                        own_feats[ind + 6] = 1
 
-        if self.obs_timestep_number:
-            agent_obs = np.append(agent_obs,
-                                  self._episode_steps / self.episode_limit)
+        agent_obs = np.concatenate((move_feats.flatten(),
+                                    enemy_feats.flatten(),
+                                    ally_feats.flatten(),
+                                    own_feats.flatten()))
 
-        if self.debug:
-            logging.debug("Obs Agent: {}".format(agent_id).center(60, "-"))
-            logging.debug("Avail. actions {}".format(
-                self.get_avail_agent_actions(agent_id)))
-            logging.debug("Move feats {}".format(move_feats))
-            logging.debug("Enemy feats {}".format(enemy_feats))
-            logging.debug("Ally feats {}".format(ally_feats))
-            logging.debug("Own feats {}".format(own_feats))
+        if self.debug_inputs:
+            print("***************************************")
+            print("Agent: ", agent_id)
+            print("Available Actions\n", self.get_avail_agent_actions(agent_id))
+            print("Move feats\n", move_feats)
+            print("Enemy feats\n", enemy_feats)
+            print("Ally feats\n", ally_feats)
+            print("Own feats\n", own_feats)
+            print("***************************************")
 
         return agent_obs
 
     def get_obs(self):
-        """Returns all agent observations in a list.
-        NOTE: Agents should have access only to their local observations
-        during decentralised execution.
-        """
         agents_obs = [self.get_obs_agent(i) for i in range(self.n_agents)]
         return agents_obs
 
     def get_state(self):
-        """Returns the global state.
-        NOTE: This functon should not be used during decentralised execution.
-        """
+
         if self.obs_instead_of_state:
-            obs_concat = np.concatenate(self.get_obs(), axis=0).astype(
-                np.float32
-            )
+            obs_concat = np.concatenate(self.get_obs(), axis=0).astype(np.float32)
             return obs_concat
 
         nf_al = 4 + self.shield_bits_ally + self.unit_type_bits
@@ -1124,33 +920,20 @@ class StarCraft2Env(MultiAgentEnv):
             if al_unit.health > 0:
                 x = al_unit.pos.x
                 y = al_unit.pos.y
-                max_cd = self.unit_max_cooldown(al_unit)
+                max_cd = self.unit_max_cooldown(al_id)
 
-                ally_state[al_id, 0] = (
-                    al_unit.health / al_unit.health_max
-                )  # health
-                if (
-                    self.map_type == "MMM"
-                    and al_unit.unit_type == self.medivac_id
-                ):
-                    ally_state[al_id, 1] = al_unit.energy / max_cd  # energy
+                ally_state[al_id, 0] = al_unit.health / al_unit.health_max # health
+                if self.map_type == 'MMM' and al_unit.unit_type == self.medivac_id:
+                    ally_state[al_id, 1] = al_unit.energy / max_cd # energy
                 else:
-                    ally_state[al_id, 1] = (
-                        al_unit.weapon_cooldown / max_cd
-                    )  # cooldown
-                ally_state[al_id, 2] = (
-                    x - center_x
-                ) / self.max_distance_x  # relative X
-                ally_state[al_id, 3] = (
-                    y - center_y
-                ) / self.max_distance_y  # relative Y
+                    ally_state[al_id, 1] = al_unit.weapon_cooldown / max_cd # cooldown
+                ally_state[al_id, 2] = (x - center_x) / self.max_distance_x # relative X
+                ally_state[al_id, 3] = (y - center_y) / self.max_distance_y # relative Y
 
                 ind = 4
                 if self.shield_bits_ally > 0:
                     max_shield = self.unit_max_shield(al_unit)
-                    ally_state[al_id, ind] = (
-                        al_unit.shield / max_shield
-                    )  # shield
+                    ally_state[al_id, ind] = al_unit.shield / max_shield # shield
                     ind += 1
 
                 if self.unit_type_bits > 0:
@@ -1162,22 +945,14 @@ class StarCraft2Env(MultiAgentEnv):
                 x = e_unit.pos.x
                 y = e_unit.pos.y
 
-                enemy_state[e_id, 0] = (
-                    e_unit.health / e_unit.health_max
-                )  # health
-                enemy_state[e_id, 1] = (
-                    x - center_x
-                ) / self.max_distance_x  # relative X
-                enemy_state[e_id, 2] = (
-                    y - center_y
-                ) / self.max_distance_y  # relative Y
+                enemy_state[e_id, 0] = e_unit.health / e_unit.health_max # health
+                enemy_state[e_id, 1] = (x - center_x) / self.max_distance_x # relative X
+                enemy_state[e_id, 2] = (y - center_y) / self.max_distance_y # relative Y
 
                 ind = 3
                 if self.shield_bits_enemy > 0:
                     max_shield = self.unit_max_shield(e_unit)
-                    enemy_state[e_id, ind] = (
-                        e_unit.shield / max_shield
-                    )  # shield
+                    enemy_state[e_id, ind] = e_unit.shield / max_shield # shield
                     ind += 1
 
                 if self.unit_type_bits > 0:
@@ -1185,84 +960,70 @@ class StarCraft2Env(MultiAgentEnv):
                     enemy_state[e_id, ind + type_id] = 1
 
         state = np.append(ally_state.flatten(), enemy_state.flatten())
+
+        if self.map_type == 'bunker':
+            bunker_feats = np.zeros(1 + 2 * self.n_agents, dtype=np.float32)
+            if self.bunker.health > 0:
+                bunker_feats[0] = self.bunker.health / self.bunker.health_max # health
+                for al_id, unit in self.agents.items():
+                    if unit.tag in self.bunker_passengers:
+                        # unit is inside the bunker
+                        bunker_feats[1 + al_id] = 1
+                        if unit.tag == self.bunker_chief:
+                            # unit is the chief
+                            bunker_feats[1 + self.n_agents + al_id] = 1
+            state = np.append(state, bunker_feats.flatten())
+
         if self.state_last_action:
             state = np.append(state, self.last_action.flatten())
-        if self.state_timestep_number:
-            state = np.append(state,
-                              self._episode_steps / self.episode_limit)
 
         state = state.astype(dtype=np.float32)
 
-        if self.debug:
-            logging.debug("STATE".center(60, "-"))
-            logging.debug("Ally state {}".format(ally_state))
-            logging.debug("Enemy state {}".format(enemy_state))
-            if self.state_last_action:
-                logging.debug("Last actions {}".format(self.last_action))
+        if self.debug_inputs:
+            print("------------ STATE ---------------")
+            print("Ally state\n", ally_state)
+            print("Enemy state\n", enemy_state)
+            print("Last action\n", self.last_action)
+            if self.map_type == 'bunker':
+                print("Bunker state\n", bunker_feats)
+                print("Bunker passangers\n", self.bunker_passengers)
+                print("Bunker chief\n", self.bunker_chief)
+            print("----------------------------------")
 
         return state
 
-    def get_obs_enemy_feats_size(self):
-        """ Returns the dimensions of the matrix containing enemy features.
-        Size is n_enemies x n_features.
-        """
-        nf_en = 4 + self.unit_type_bits
+    def get_unit_type_id(self, unit, ally):
 
-        if self.obs_all_health:
-            nf_en += 1 + self.shield_bits_enemy
+        if ally: # we use new SC2 unit types
+            type_id = unit.unit_type - self.min_unit_type
 
-        return self.n_enemies, nf_en
+        else: # 'We use default SC2 unit types'
 
-    def get_obs_ally_feats_size(self):
-        """Returns the dimensions of the matrix containing ally features.
-        Size is n_allies x n_features.
-        """
-        nf_al = 4 + self.unit_type_bits
+            if self.map_type == 'sz':
+                # id(Stalker) = 74, id(Zealot) = 73
+                type_id = unit.unit_type - 73
+            elif self.map_type == 'ze_ba':
+                if unit.unit_type == 9:
+                    type_id = 0
+                else:
+                    type_id = 1
+            elif self.map_type == '2step':
+                if unit.unit_type == 73:
+                    return 0
+                else:
+                    return 1
+            elif self.map_type == 'MMM':
+                if unit.unit_type == 51:
+                    type_id = 0
+                elif unit.unit_type == 48:
+                    type_id = 1
+                else:
+                    type_id = 2
 
-        if self.obs_all_health:
-            nf_al += 1 + self.shield_bits_ally
-
-        if self.obs_last_action:
-            nf_al += self.n_actions
-
-        return self.n_agents - 1, nf_al
-
-    def get_obs_own_feats_size(self):
-        """Returns the size of the vector containing the agents' own features.
-        """
-        own_feats = self.unit_type_bits
-        if self.obs_own_health:
-            own_feats += 1 + self.shield_bits_ally
-        if self.obs_timestep_number:
-            own_feats += 1
-
-        return own_feats
-
-    def get_obs_move_feats_size(self):
-        """Returns the size of the vector containing the agents's movement-related features."""
-        move_feats = self.n_actions_move
-        if self.obs_pathing_grid:
-            move_feats += self.n_obs_pathing
-        if self.obs_terrain_height:
-            move_feats += self.n_obs_height
-
-        return move_feats
-
-    def get_obs_size(self):
-        """Returns the size of the observation."""
-        own_feats = self.get_obs_own_feats_size()
-        move_feats = self.get_obs_move_feats_size()
-
-        n_enemies, n_enemy_feats = self.get_obs_enemy_feats_size()
-        n_allies, n_ally_feats = self.get_obs_ally_feats_size()
-
-        enemy_feats = n_enemies * n_enemy_feats
-        ally_feats = n_allies * n_ally_feats
-
-        return move_feats + enemy_feats + ally_feats + own_feats
+        return type_id
 
     def get_state_size(self):
-        """Returns the size of the global state."""
+
         if self.obs_instead_of_state:
             return self.get_obs_size() * self.n_agents
 
@@ -1276,123 +1037,60 @@ class StarCraft2Env(MultiAgentEnv):
 
         if self.state_last_action:
             size += self.n_agents * self.n_actions
-        if self.state_timestep_number:
-            size += 1
+
+        if self.map_type == 'bunker':
+            size += 1 + 2 * self.n_agents
 
         return size
 
-    def get_visibility_matrix(self):
-        """Returns a boolean numpy array of dimensions 
-        (n_agents, n_agents + n_enemies) indicating which units
-        are visible to each agent.
-        """
-        arr = np.zeros(
-            (self.n_agents, self.n_agents + self.n_enemies),
-            dtype=np.bool,
-        )
-
-        for agent_id in range(self.n_agents):
-            current_agent = self.get_unit_by_id(agent_id)
-            if current_agent.health > 0:  # it agent not dead
-                x = current_agent.pos.x
-                y = current_agent.pos.y
-                sight_range = self.unit_sight_range(agent_id)
-
-                # Enemies
-                for e_id, e_unit in self.enemies.items():
-                    e_x = e_unit.pos.x
-                    e_y = e_unit.pos.y
-                    dist = self.distance(x, y, e_x, e_y)
-
-                    if (dist < sight_range and e_unit.health > 0):
-                        # visible and alive
-                        arr[agent_id, self.n_agents + e_id] = 1
-
-                # The matrix for allies is filled symmetrically
-                al_ids = [
-                    al_id for al_id in range(self.n_agents)
-                    if al_id > agent_id
-                ]
-                for i, al_id in enumerate(al_ids):
-                    al_unit = self.get_unit_by_id(al_id)
-                    al_x = al_unit.pos.x
-                    al_y = al_unit.pos.y
-                    dist = self.distance(x, y, al_x, al_y)
-
-                    if (dist < sight_range and al_unit.health > 0):
-                        # visible and alive
-                        arr[agent_id, al_id] = arr[al_id, agent_id] = 1
-
-        return arr
-
-    def get_unit_type_id(self, unit, ally):
-        """Returns the ID of unit type in the given scenario."""
-        if ally:  # use new SC2 unit types
-            type_id = unit.unit_type - self._min_unit_type
-        else:  # use default SC2 unit types
-            if self.map_type == "stalkers_and_zealots":
-                # id(Stalker) = 74, id(Zealot) = 73
-                type_id = unit.unit_type - 73
-            elif self.map_type == "colossi_stalkers_zealots":
-                # id(Stalker) = 74, id(Zealot) = 73, id(Colossus) = 4
-                if unit.unit_type == 4:
-                    type_id = 0
-                elif unit.unit_type == 74:
-                    type_id = 1
-                else:
-                    type_id = 2
-            elif self.map_type == "bane":
-                if unit.unit_type == 9:
-                    type_id = 0
-                else:
-                    type_id = 1
-            elif self.map_type == "MMM":
-                if unit.unit_type == 51:
-                    type_id = 0
-                elif unit.unit_type == 48:
-                    type_id = 1
-                else:
-                    type_id = 2
-
-        return type_id
-
     def get_avail_agent_actions(self, agent_id):
-        """Returns the available actions for agent_id."""
         unit = self.get_unit_by_id(agent_id)
         if unit.health > 0:
-            # cannot choose no-op when alive
+            # cannot do no-op as alife
             avail_actions = [0] * self.n_actions
 
             # stop should be allowed
             avail_actions[1] = 1
 
+            if self.map_type == 'bunker' and self.bunker_open == 1:
+                dist = self.distance(unit.pos.x, unit.pos.y, self.bunker.pos.x, self.bunker.pos.y)
+                if self.bunker.health > 0 and unit.tag not in self.bunker_passengers and dist <= self.bunker_enter_range:
+                    # can see the bunker from outside
+                    avail_actions[6] = 1  # can enter the bunker
+                elif unit.tag in self.bunker_passengers:
+                    # in the bunker
+                    avail_actions[7] = 1 # can leave the bunker
+                    if unit.tag != self.bunker_chief:
+                        # not the chief
+                        return avail_actions
+
             # see if we can move
-            if self.can_move(unit, Direction.NORTH):
+            if self.can_move(unit, 0) and self.map_type != '3step':
                 avail_actions[2] = 1
-            if self.can_move(unit, Direction.SOUTH):
+            if self.can_move(unit, 1):
                 avail_actions[3] = 1
-            if self.can_move(unit, Direction.EAST):
+            if self.can_move(unit, 2):
                 avail_actions[4] = 1
-            if self.can_move(unit, Direction.WEST):
+            if self.can_move(unit, 3):
                 avail_actions[5] = 1
 
-            # Can attack only alive units that are alive in the shooting range
+            # can attack only those who is alife
+            # and in the shooting range
+
             shoot_range = self.unit_shoot_range(agent_id)
+            if self.map_type == 'bunker' and self.bunker_open == 1 and unit.tag == self.bunker_chief:
+                # inside the bunker and chief commander
+                shoot_range += 3
+                avail_actions[2:6] = [0] * 4 # can't move
 
             target_items = self.enemies.items()
-            if self.map_type == "MMM" and unit.unit_type == self.medivac_id:
-                # Medivacs cannot heal themselves or other flying units
-                target_items = [
-                    (t_id, t_unit)
-                    for (t_id, t_unit) in self.agents.items()
-                    if t_unit.unit_type != self.medivac_id
-                ]
+            if self.map_type == 'MMM' and unit.unit_type == self.medivac_id:
+                # Medivacs cannot heal themselves and other flying units
+                target_items = [(t_id, t_unit) for (t_id, t_unit) in self.agents.items() if t_unit.unit_type != self.medivac_id]
 
             for t_id, t_unit in target_items:
                 if t_unit.health > 0:
-                    dist = self.distance(
-                        unit.pos.x, unit.pos.y, t_unit.pos.x, t_unit.pos.y
-                    )
+                    dist = self.distance(unit.pos.x, unit.pos.y, t_unit.pos.x, t_unit.pos.y)
                     if dist <= shoot_range:
                         avail_actions[t_id + self.n_actions_no_attack] = 1
 
@@ -1402,129 +1100,175 @@ class StarCraft2Env(MultiAgentEnv):
             # only no-op allowed
             return [1] + [0] * (self.n_actions - 1)
 
-    def get_avail_actions(self):
-        """Returns the available actions of all agents in a list."""
-        avail_actions = []
-        for agent_id in range(self.n_agents):
-            avail_agent = self.get_avail_agent_actions(agent_id)
-            avail_actions.append(avail_agent)
+    def get_unrestricted_actions(self, agent_id):
+        unit = self.get_unit_by_id(agent_id)
+        if unit.health > 0:
+            # cannot do no-op as alife
+            avail_actions = [1] * self.n_actions
+            avail_actions[0] = 0
+        else:
+            avail_actions = [0] * self.n_actions
+            avail_actions[0] = 1
         return avail_actions
 
-    def close(self):
-        """Close StarCraft II."""
-        if self._sc2_proc:
-            self._sc2_proc.close()
+    def get_avail_actions(self):
 
-    def seed(self):
-        """Returns the random seed used by the environment."""
-        return self._seed
+        avail_actions = []
+        for agent_id in range(self.n_agents):
+            if self.restrict_actions:
+                avail_agent = self.get_avail_agent_actions(agent_id)
+                avail_actions.append(avail_agent)
+            else:
+                avail_agent = self.get_unrestricted_actions(agent_id)
+                avail_actions.append(avail_agent)
+
+        return avail_actions
+
+    def get_obs_size(self):
+
+        nf_al = 4 + self.unit_type_bits
+        nf_en = 4 + self.unit_type_bits
+
+        if self.obs_all_health:
+            nf_al += 1 + self.shield_bits_ally
+            nf_en += 1 + self.shield_bits_enemy
+
+        own_feats = self.unit_type_bits
+        if self.obs_own_health:
+            own_feats += 1 + self.shield_bits_ally
+        if self.map_type == 'bunker':
+            own_feats += 7
+
+        if self.obs_last_action:
+            nf_al += self.n_actions
+
+        move_feats = self.n_actions_move
+        if self.obs_pathing_grid:
+            move_feats += self.n_obs_pathing
+        if self.obs_terrain_height:
+            move_feats += self.n_obs_height
+        if '2_corridors' in self.map_name:
+            move_feats += 1
+
+        enemy_feats = self.n_enemies * nf_en
+        ally_feats = (self.n_agents - 1) * nf_al
+
+        return move_feats + enemy_feats + ally_feats + own_feats
+
+    def close(self):
+        self._sc2_proc.close()
 
     def render(self):
-        """Not implemented."""
         pass
 
-    def _kill_all_units(self):
-        """Kill all units on the map."""
-        units_alive = [
-            unit.tag for unit in self.agents.values() if unit.health > 0
-        ] + [unit.tag for unit in self.enemies.values() if unit.health > 0]
-        debug_command = [
-            d_pb.DebugCommand(kill_unit=d_pb.DebugKillUnit(tag=units_alive))
-        ]
-        self._controller.debug(debug_command)
+    def kill_all_units(self):
+        units_alive = [unit.tag for unit in self.agents.values() if unit.health > 0] + [unit.tag for unit in self.enemies.values() if unit.health > 0]
+        if self.map_type == 'bunker' and self.bunker.health > 0:
+            units_alive += [self.bunker.tag]
+
+        debug_command = [d_pb.DebugCommand(kill_unit = d_pb.DebugKillUnit(tag = units_alive))]
+        self.controller.debug(debug_command)
 
     def init_units(self):
-        """Initialise the units."""
+
+        # In case controller step fails
         while True:
-            # Sometimes not all units have yet been created by SC2
+
             self.agents = {}
             self.enemies = {}
 
-            ally_units = [
-                unit
-                for unit in self._obs.observation.raw_data.units
-                if unit.owner == 1
-            ]
-            ally_units_sorted = sorted(
-                ally_units,
-                key=attrgetter("unit_type", "pos.x", "pos.y"),
-                reverse=False,
-            )
+            ally_units = [unit for unit in self._obs.observation.raw_data.units if unit.owner == 1]
+            ally_units_sorted = sorted(ally_units, key=attrgetter('unit_type', 'pos.x', 'pos.y'), reverse=False)
 
-            enemy_units = [
-                unit
-                for unit in self._obs.observation.raw_data.units
-                if unit.owner == 2
-            ]
-            enemy_units_sorted = sorted(
-                enemy_units,
-                key=attrgetter("unit_type", "pos.x", "pos.y"),
-                reverse=False,
-            )
+            if self.map_type == 'bunker' and len(ally_units_sorted) == self.n_agents + 1:
+                self.bunker = ally_units_sorted.pop(0)
+                self.bunker_passengers = []
+                self.bunker_chief = None
 
             for i in range(len(ally_units_sorted)):
                 self.agents[i] = ally_units_sorted[i]
-                if self.debug:
-                    logging.debug(
-                        "Unit {} is {}, x = {}, y = {}".format(
-                            len(self.agents),
-                            self.agents[i].unit_type,
-                            self.agents[i].pos.x,
-                            self.agents[i].pos.y,
-                        )
-                    )
+                if self.debug_inputs:
+                    print("Unit %d is %d, x = %.1f, y = %1.f"  % (len(self.agents), self.agents[i].unit_type, self.agents[i].pos.x, self.agents[i].pos.y))
 
-            for i in range(len(enemy_units_sorted)):
-                self.enemies[i] = enemy_units_sorted[i]
-                if self.debug:
-                    logging.debug(
-                        "Enemy Unit {} is {}, x = {}, y = {}".format(
-                            len(self.enemies),
-                            self.enemies[i].unit_type,
-                            self.enemies[i].pos.x,
-                            self.enemies[i].pos.y
-                        )
-                    )
-                if self._episode_count == 0:
-                    self.max_reward += self.enemies[i].health_max + self.enemies[i].shield_max
+            for unit in self._obs.observation.raw_data.units:
+                if unit.owner == 2:
+                    self.enemies[len(self.enemies)] = unit
+                    if self._episode_count == 1:
+                        self.max_reward += unit.health_max + unit.shield_max
 
-            if self._episode_count == 0:
-                min_unit_type = min(
-                    unit.unit_type for unit in self.agents.values()
-                )
-                self._init_ally_unit_types(min_unit_type)
+            if self.map_type == '2step':
+                zealots = [unit for unit in self._obs.observation.raw_data.units if unit.owner == 2 and unit.unit_type == 73]
+                zealots = sorted(zealots, key=attrgetter('pos.x', 'pos.y'), reverse=False)
+                self.zealot_tags = [unit.tag for unit in zealots]
 
-            all_agents_created = (len(self.agents) == self.n_agents)
-            all_enemies_created = (len(self.enemies) == self.n_enemies)
+            if self._episode_count == 1:
+                min_unit_type = min(unit.unit_type for unit in self.agents.values())
+                self.init_ally_unit_types(min_unit_type)
 
-            if all_agents_created and all_enemies_created:  # all good
-                if self._episode_count == 0:
-                    self.feature_vector = self.generate_feature_vector()
-                    self.weight_vector = self.generateWeightVector()
-                    self.weight_vector /= self.max_reward / self.reward_scale_rate
-                    for feat_id, feat in enumerate(self.feature_vector):
-                        print(feat, self.weight_vector[feat_id])
+            if len(self.agents) == self.n_agents and len(self.enemies) == self.n_enemies:
+                # All good
                 return
 
             try:
-                self._controller.step(1)
-                self._obs = self._controller.observe()
-            except (protocol.ProtocolError, protocol.ConnectionError):
+                self.controller.step(1)
+                self._obs = self.controller.observe()
+            except protocol.ProtocolError:
+                self.full_restart()
+                self.reset()
+            except protocol.ConnectionError:
                 self.full_restart()
                 self.reset()
 
     def update_units(self):
-        """Update units after an environment step.
-        This function assumes that self._obs is up-to-date.
-        """
+
+        # This function assumes that self._obs is up-to-date
         n_ally_alive = 0
         n_enemy_alive = 0
 
         # Store previous state
-        self.previous_ally_units = deepcopy(self.agents)
+        self.previous_agent_units = deepcopy(self.agents)
         self.previous_enemy_units = deepcopy(self.enemies)
 
+        #print('=-------------------------=')
+        #print(self._obs.observation.raw_data.units)
+        #print('=-------------------------=')
+
+        if self.map_type == 'bunker' and self.bunker.health > 0:
+            updated = False
+            for unit in self._obs.observation.raw_data.units:
+                if unit.tag == self.bunker.tag:
+                    self.bunker = unit
+                    n_ally_alive += self.bunker.cargo_space_taken
+                    if self.bunker.cargo_space_taken > 0:
+                        self.bunker_passengers = [p.tag for p in self.bunker.passengers]
+                        if self.bunker.cargo_space_taken == 1:
+                            # single unit inside
+                            self.bunker_chief = self.bunker_passengers[0]
+                        elif ((self.bunker_chief is None)
+                              or self.bunker_chief is not None and self.bunker_chief not in self.bunker_passengers):
+                            # chief left the bunker
+                            self.bunker_chief = np.random.choice(self.bunker_passengers)
+                    else:
+                        # no one inside
+                        self.bunker_passengers = []
+                        self.bunker_chief = None
+
+                    updated = True
+                    break
+
+            if not updated:
+                self.bunker.health = 0
+                self.bunker_passengers = []
+                self.bunker_chief = None
+
         for al_id, al_unit in self.agents.items():
+
+            if self.map_type == 'bunker' and al_unit.tag in self.bunker_passengers:
+                # found the unit!
+                self.agents[al_id].pos.x = self.bunker.pos.x
+                self.agents[al_id].pos.y = self.bunker.pos.y
+                continue
+
             updated = False
             for unit in self._obs.observation.raw_data.units:
                 if al_unit.tag == unit.tag:
@@ -1533,7 +1277,7 @@ class StarCraft2Env(MultiAgentEnv):
                     n_ally_alive += 1
                     break
 
-            if not updated:  # dead
+            if not updated: # means dead
                 al_unit.health = 0
 
         for e_id, e_unit in self.enemies.items():
@@ -1545,85 +1289,171 @@ class StarCraft2Env(MultiAgentEnv):
                     n_enemy_alive += 1
                     break
 
-            if not updated:  # dead
+            if not updated: # means dead
                 e_unit.health = 0
 
-        if (n_ally_alive == 0 and n_enemy_alive > 0
-                or self.only_medivac_left(ally=True)):
-            return -1  # lost
-        if (n_ally_alive > 0 and n_enemy_alive == 0
-                or self.only_medivac_left(ally=False)):
-            return 1  # won
+        if self.heuristic:
+            for al_id, al_unit in self.agents.items():
+                current_target = self.heuristic_targets[al_id]
+                if current_target == 0 or self.enemies[current_target].health == 0:
+                    x = al_unit.pos.x
+                    y = al_unit.pos.y
+                    min_dist = 32
+                    min_id = -1
+                    for e_id, e_unit in self.enemies.items():
+                        if e_unit.health > 0:
+                            dist = self.distance(x, y, e_unit.pos.x, e_unit.pos.y)
+                            if dist < min_dist:
+                                min_dist = dist
+                                min_id = e_id
+                    self.heuristic_targets[al_id] = min_id
+
+        if (n_ally_alive == 0 and n_enemy_alive > 0) or self.only_medivac_left(ally=True):
+            return -1 # loss
+        if (n_ally_alive > 0 and n_enemy_alive == 0) or self.only_medivac_left(ally=False):
+            return 1 # win
         if n_ally_alive == 0 and n_enemy_alive == 0:
-            return 0
+            return 0 # tie, not sure if this is possible
 
         return None
 
-    def _init_ally_unit_types(self, min_unit_type):
-        """Initialise ally unit types. Should be called once from the
-        init_units function.
-        """
-        self._min_unit_type = min_unit_type
-        if self.map_type == "marines":
-            self.marine_id = min_unit_type
-        elif self.map_type == "stalkers_and_zealots":
-            self.stalker_id = min_unit_type
-            self.zealot_id = min_unit_type + 1
-        elif self.map_type == "colossi_stalkers_zealots":
-            self.colossus_id = min_unit_type
-            self.stalker_id = min_unit_type + 1
-            self.zealot_id = min_unit_type + 2
-        elif self.map_type == "MMM":
-            self.marauder_id = min_unit_type
-            self.marine_id = min_unit_type + 1
-            self.medivac_id = min_unit_type + 2
-        elif self.map_type == "zealots":
-            self.zealot_id = min_unit_type
-        elif self.map_type == "hydralisks":
-            self.hydralisk_id = min_unit_type
-        elif self.map_type == "stalkers":
-            self.stalker_id = min_unit_type
-        elif self.map_type == "colossus":
-            self.colossus_id = min_unit_type
-        elif self.map_type == "bane":
-            self.baneling_id = min_unit_type
-            self.zergling_id = min_unit_type + 1
-
     def only_medivac_left(self, ally):
-        """Check if only Medivac units are left."""
-        if self.map_type != "MMM":
+        if self.map_type != 'MMM':
             return False
 
         if ally:
-            units_alive = [
-                a
-                for a in self.agents.values()
-                if (a.health > 0 and a.unit_type != self.medivac_id)
-            ]
+            units_alive = [a for a in self.agents.values() if (a.health > 0 and a.unit_type != self.medivac_id)]
             if len(units_alive) == 0:
                 return True
             return False
         else:
-            units_alive = [
-                a
-                for a in self.enemies.values()
-                if (a.health > 0 and a.unit_type != self.medivac_id)
-            ]
+            units_alive = [a for a in self.enemies.values() if (a.health > 0 and a.unit_type != self.medivac_id)]
             if len(units_alive) == 1 and units_alive[0].unit_type == 54:
                 return True
             return False
 
     def get_unit_by_id(self, a_id):
-        """Get unit by ID."""
         return self.agents[a_id]
 
     def get_stats(self):
-        stats = {
-            "battles_won": self.battles_won,
-            "battles_game": self.battles_game,
-            "battles_draw": self.timeouts,
-            "win_rate": self.battles_won / self.battles_game,
-            "timeouts": self.timeouts,
-            "restarts": self.force_restarts,
-        }
+        stats = {}
+        stats["battles_won"] = self.battles_won
+        stats["battles_game"] = self.battles_game
+        stats["battles_draw"] = self.timeouts
+        stats["win_rate"] = self.battles_won / self.battles_game
+        stats["timeouts"] = self.timeouts
+        stats["restarts"] = self.force_restarts
         return stats
+
+    def print_map(self):
+        for k, x in enumerate(self.pathing_grid):
+            l = []
+            for i in x:
+                if i == 255:
+                    l.append('X')
+                else:
+                    l.append(' ')
+            print(' '.join(map(str, l)))
+
+    def open_bunker(self):
+        if self.map_type != 'bunker':
+            return
+        self.bunker_open = 1
+
+    def close_bunker(self):
+        if self.map_type != 'bunker':
+            return
+        self.bunker_open = 0
+
+    def open_corridor(self):
+        if '2_corridors' not in self.map_name:
+            return
+        self.pathing_grid = deepcopy(self.pathing_grid_orig)
+        self.corridor = 0
+
+    def close_corridor(self):
+        if '2_corridors' not in self.map_name:
+            return
+        for i in range(14, 20):
+            self.pathing_grid[0:16, i] = [255] * 16
+        self.corridor = 1
+
+    def get_agg_stats(self, stats):
+
+        current_stats = {}
+        for stat in stats:
+            for _k, _v in stat.items():
+                if not (_k in current_stats):
+                    current_stats[_k] = []
+                if _k in ["win_rate"]:
+                    continue
+                current_stats[_k].append(_v)
+
+        # average over stats
+        aggregate_stats = {}
+        for _k, _v in current_stats.items():
+            if _k in ["win_rate"]:
+                aggregate_stats[_k] = np.mean([ (_a - _b)/(_c - _d) for _a, _b, _c, _d in zip(current_stats["battles_won"],
+                                                                                              [0]*len(current_stats["battles_won"]) if self.last_stats is None else self.last_stats["battles_won"],
+                                                                                              current_stats["battles_game"],
+                                                                                              [0]*len(current_stats["battles_game"]) if self.last_stats is None else
+                                                                                              self.last_stats["battles_game"])
+                                                if (_c - _d) != 0.0])
+            else:
+                aggregate_stats[_k] = np.mean([_a-_b for _a, _b in zip(_v, [0]*len(_v) if self.last_stats is None else self.last_stats[_k])])
+
+        self.last_stats = current_stats
+        return aggregate_stats
+
+# from components.transforms_old import _seq_mean
+
+class StatsAggregator():
+
+    def __init__(self):
+        self.last_stats = None
+        self.stats = []
+        pass
+
+    def aggregate(self, stats, add_stat_fn):
+
+        current_stats = {}
+        for stat in stats:
+            for _k, _v in stat.items():
+                if not (_k in current_stats):
+                    current_stats[_k] = []
+                if _k in ["win_rate"]:
+                    continue
+                current_stats[_k].append(_v)
+
+        # average over stats
+        aggregate_stats = {}
+        for _k, _v in current_stats.items():
+            if _k in ["win_rate"]:
+                aggregate_stats[_k] = np.mean([ (_a - _b)/(_c - _d) for _a, _b, _c, _d in zip(current_stats["battles_won"],
+                                                                                              [0]*len(current_stats["battles_won"]) if self.last_stats is None else self.last_stats["battles_won"],
+                                                                                              current_stats["battles_game"],
+                                                                                              [0]*len(current_stats["battles_game"]) if self.last_stats is None else
+                                                                                              self.last_stats["battles_game"])
+                                                if (_c - _d) != 0.0])
+            else:
+                aggregate_stats[_k] = np.mean([_a-_b for _a, _b in zip(_v, [0]*len(_v) if self.last_stats is None else self.last_stats[_k])])
+
+        # add stats that have just been produced to tensorboard / sacred
+        for _k, _v in aggregate_stats.items():
+            add_stat_fn(_k, _v)
+
+        # collect stats for logging horizon
+        self.stats.append(aggregate_stats)
+        # update last stats
+        self.last_stats = current_stats
+        pass
+
+    def log(self, log_directly=False):
+        assert not log_directly, "log_directly not supported."
+        logging_str = " Win rate: {}".format(_seq_mean([ stat["win_rate"] for stat in self.stats ]))\
+                    + " Timeouts: {}".format(_seq_mean([ stat["timeouts"] for stat in self.stats ]))\
+                    + " Restarts: {}".format(_seq_mean([ stat["restarts"] for stat in self.stats ]))
+
+        # flush stats
+        self.stats = []
+        return logging_str

@@ -327,3 +327,4 @@ def get_smac_map_registry():
 
 for name in map_param_registry.keys():
     globals()[name] = type(name, (SMACMap,), dict(filename=name))
+

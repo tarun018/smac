@@ -1,5 +1,6 @@
 from ..multiagentenv import MultiAgentEnv
-from .map_params import get_map_params, map_present
+from smac.env.starcraft2.maps import get_map_params
+#from .map_params import get_map_params, map_present
 from utils.dict2namedtuple import convert
 from operator import attrgetter
 from copy import deepcopy
@@ -64,7 +65,7 @@ bunker_id = 24
 StarCraft II
 '''
 
-class SC2(MultiAgentEnv):
+class StarCraft2Env(MultiAgentEnv):
 
     def __init__(self, **kwargs):
 
@@ -73,8 +74,8 @@ class SC2(MultiAgentEnv):
             args = convert(args)
         # Read arguments
         self.map_name = args.map_name
-        assert map_present(self.map_name), \
-            "map {} not in map registry! please add.".format(self.map_name)
+        # assert map_present(self.map_name), \
+        #     "map {} not in map registry! please add.".format(self.map_name)
         map_params = convert(get_map_params(self.map_name))
         self.n_agents = map_params.n_agents
         self.n_enemies = map_params.n_enemies
@@ -131,13 +132,6 @@ class SC2(MultiAgentEnv):
             self.bunker_enter_range = args.bunker_enter_range
             self.bunker_open = 0
         self.n_actions = self.n_actions_no_attack + self.n_enemies
-
-        if sys.platform == 'linux':
-            os.environ['SC2PATH'] = os.path.join(os.getcwd(), "3rdparty", 'StarCraftII')
-            self.game_version = args.game_version
-        else:
-            # Can be derived automatically
-            self.game_version = "4.6.2"
 
         # Launch the game
         self._launch()
@@ -235,7 +229,7 @@ class SC2(MultiAgentEnv):
                 raw = True, # raw, feature-level data
                 score = True)
 
-        self._sc2_proc = self._run_config.start(version=self.game_version, window_size=self.window_size)
+        self._sc2_proc = self._run_config.start(window_size=self.window_size)
         self.controller = self._sc2_proc.controller
 
         # Create the game.

@@ -191,6 +191,48 @@ class StarCraft2Env(MultiAgentEnv):
         #print(self.controller.data_raw())
         #sys.exit()
 
+    def get_feature_vector(self):
+        return self.feature_vector
+
+    def get_weight_vector(self):
+        return self.weight_vector
+
+    def generate_feature_vector(self):
+        feats = []
+        if not self.reward_only_positive:
+            for al_id in range(self.n_agents):
+                feats.append(("health_diff", "ally", al_id))
+                feats.append(("dead", "ally", al_id))
+        for e_id in range(self.n_enemies):
+            feats.append(("health_diff", "enemy", e_id))
+            feats.append(("dead", "enemy", e_id))
+        feats.append("win")
+        return feats
+
+    def generateWeightVector(self):
+        al_weights = []
+        en_weights = []
+
+        if not self.reward_only_positive:
+            for al_id, al_unit in self.agents.items():
+                scale_to_use = self.reward_negative_scale
+                health_scale = self.reward_negative_scale
+
+                al_weights.append(-1.0 * health_scale * (al_unit.health_max + al_unit.shield_max))
+                al_weights.append(-1.0 * self.reward_death_value * scale_to_use)
+
+        for e_id, e_unit in self.enemies.items():
+
+            scale_to_use = 1.0
+            health_scale = 1.0
+
+            en_weights.append(health_scale * (e_unit.health_max + e_unit.shield_max))
+            en_weights.append(scale_to_use * self.reward_death_value)
+
+        en_weights.append(self.reward_win)
+
+        return np.concatenate((np.array(al_weights), np.array(en_weights)), axis=0)
+
     def init_ally_unit_types(self, min_unit_type):
         # This should be called once from the init_units function
 
@@ -333,10 +375,10 @@ class StarCraft2Env(MultiAgentEnv):
             self._obs = self.controller.observe()
         except protocol.ProtocolError:
             self.full_restart()
-            return 0, True, {}
+            return 0, np.zeros(self.weight_vector.shape), True, {}
         except protocol.ConnectionError:
             self.full_restart()
-            return 0, True, {}
+            return 0, np.zeros(self.weight_vector.shape), True, {}
 
         self._total_steps += 1
         self._episode_steps += 1
@@ -345,8 +387,20 @@ class StarCraft2Env(MultiAgentEnv):
         end_game = self.update_units()
 
         terminated = False
-        reward = self.reward_battle()
+        reward, step_feature = self.reward_battle()
         info = {"battle_won": False}
+
+        # count units that are still alive
+        dead_allies, dead_enemies = 0, 0
+        for al_id, al_unit in self.agents.items():
+            if al_unit.health == 0:
+                dead_allies += 1
+        for e_id, e_unit in self.enemies.items():
+            if e_unit.health == 0:
+                dead_enemies += 1
+
+        info['dead_allies'] = dead_allies
+        info['dead_enemies'] = dead_enemies
 
         if self.map_type == '2step':
             dead_zealots = [unit.tag for _, unit in self.enemies.items() if unit.unit_type == 73 and unit.health == 0]
@@ -382,6 +436,7 @@ class StarCraft2Env(MultiAgentEnv):
                 self.battles_won += 1
                 self.win_counted = True
                 info["battle_won"] = True
+                step_feature[-1] = 1.0
                 if not self.reward_sparse:
                     reward += self.reward_win
                 else:
@@ -408,7 +463,11 @@ class StarCraft2Env(MultiAgentEnv):
         if self.reward_scale:
             reward /= (self.max_reward / self.reward_scale_rate)
 
-        return reward, terminated, info
+        if not self.reward_only_positive:
+            assert abs(np.dot(step_feature, self.weight_vector) - reward) < 1e-5, print(
+                np.dot(step_feature, self.weight_vector), reward)
+
+        return reward, step_feature, terminated, info
 
     def get_agent_action(self, a_id, action):
 
@@ -531,13 +590,16 @@ class StarCraft2Env(MultiAgentEnv):
         return sc_action
 
     def reward_battle(self):
+        """Reward function when self.reward_spare==False.
+        Returns accumulative hit/shield point damage dealt to the enemy
+        + reward_death_value per enemy unit killed, and, in case
+        self.reward_only_positive == False, - (damage dealt to ally units
+        + reward_death_value per ally unit killed) * self.reward_negative_scale
+        """
+        step_feature = np.zeros(shape=self.weight_vector.shape)
 
         if self.reward_sparse:
-            return 0
-
-        #  delta health - delta enemies + delta deaths where value:
-        #   if enemy unit dies, add reward_death_value per dead unit
-        #   if own unit dies, subtract reward_death_value per dead unit
+            return 0, step_feature
 
         reward = 0
         delta_deaths = 0
@@ -546,61 +608,72 @@ class StarCraft2Env(MultiAgentEnv):
 
         neg_scale = self.reward_negative_scale
 
-        if self.debug_rewards:
-            for al_id in range(self.n_agents):
-                print("Agent %d: diff HP = %.f, diff shield = %.f" % (al_id, self.previous_agent_units[al_id].health - self.agents[al_id].health, self.previous_agent_units[al_id].shield - self.agents[al_id].shield))
-            print('---------------------')
-            for al_id in range(self.n_enemies):
-                print("Enemy %d: diff HP = %.f, diff shield = %.f" % (al_id, self.previous_enemy_units[al_id].health - self.enemies[al_id].health, self.previous_enemy_units[al_id].shield - self.enemies[al_id].shield))
-
         # update deaths
         for al_id, al_unit in self.agents.items():
             if not self.death_tracker_ally[al_id]:
                 # did not die so far
-                prev_health = self.previous_agent_units[al_id].health + self.previous_agent_units[al_id].shield
+                prev_health = (
+                        self.previous_agent_units[al_id].health
+                        + self.previous_agent_units[al_id].shield
+                )
+
+                if not self.reward_only_positive:
+                    health_diff_feature_index = self.feature_vector.index(("health_diff", "ally", al_id))
+                    dead_feature_index = self.feature_vector.index(("dead", "ally", al_id))
+
                 if al_unit.health == 0:
                     # just died
                     self.death_tracker_ally[al_id] = 1
                     if not self.reward_only_positive:
                         delta_deaths -= self.reward_death_value * neg_scale
                     delta_ally += prev_health * neg_scale
+
+                    if not self.reward_only_positive:
+                        step_feature[health_diff_feature_index] = prev_health / (
+                                    al_unit.health_max + al_unit.shield_max)
+                        step_feature[dead_feature_index] = 1.0
                 else:
                     # still alive
-                    delta_ally += (prev_health - al_unit.health - al_unit.shield) * neg_scale
+                    delta_ally += neg_scale * (
+                            prev_health - al_unit.health - al_unit.shield
+                    )
+
+                    if not self.reward_only_positive:
+                        step_feature[health_diff_feature_index] = (prev_health - al_unit.health - al_unit.shield) / (
+                                al_unit.health_max + al_unit.shield_max)
+
+                        step_feature[dead_feature_index] = 0.0
 
         for e_id, e_unit in self.enemies.items():
             if not self.death_tracker_enemy[e_id]:
-                prev_health = self.previous_enemy_units[e_id].health + self.previous_enemy_units[e_id].shield
+                prev_health = (
+                        self.previous_enemy_units[e_id].health
+                        + self.previous_enemy_units[e_id].shield
+                )
+
+                health_diff_feature_index = self.feature_vector.index(("health_diff", "enemy", e_id))
+                dead_feature_index = self.feature_vector.index(("dead", "enemy", e_id))
+
                 if e_unit.health == 0:
                     self.death_tracker_enemy[e_id] = 1
                     delta_deaths += self.reward_death_value
                     delta_enemy += prev_health
+
+                    step_feature[health_diff_feature_index] = prev_health / (e_unit.health_max + e_unit.shield_max)
+                    step_feature[dead_feature_index] = 1.0
                 else:
                     delta_enemy += prev_health - e_unit.health - e_unit.shield
+                    step_feature[health_diff_feature_index] = (prev_health - e_unit.health - e_unit.shield) \
+                                                              / (e_unit.health_max + e_unit.shield_max)
+
+                    step_feature[dead_feature_index] = 0.0
 
         if self.reward_only_positive:
-
-            if self.debug_rewards:
-                print("--------------------------")
-                print("Delta enemy: ", delta_enemy)
-                print("Delta deaths: ", delta_deaths)
-                print("Reward: ", delta_enemy + delta_deaths)
-                print("--------------------------")
-
-            reward = delta_enemy + delta_deaths
-            reward = abs(reward) # shield regeration
+            reward = abs(delta_enemy + delta_deaths)  # shield regeneration
         else:
-            if self.debug_rewards:
-                print("--------------------------")
-                print("Delta enemy: ", delta_enemy)
-                print("Delta deaths: ", delta_deaths)
-                print("Delta ally: ", - delta_ally)
-                print("Reward: ", delta_enemy + delta_deaths)
-                print("--------------------------")
-
             reward = delta_enemy + delta_deaths - delta_ally
 
-        return reward
+        return reward, step_feature
 
     def get_total_actions(self):
         return self.n_actions
@@ -1174,6 +1247,17 @@ class StarCraft2Env(MultiAgentEnv):
             ally_units = [unit for unit in self._obs.observation.raw_data.units if unit.owner == 1]
             ally_units_sorted = sorted(ally_units, key=attrgetter('unit_type', 'pos.x', 'pos.y'), reverse=False)
 
+            enemy_units = [
+                unit
+                for unit in self._obs.observation.raw_data.units
+                if unit.owner == 2
+            ]
+            enemy_units_sorted = sorted(
+                enemy_units,
+                key=attrgetter("unit_type", "pos.x", "pos.y"),
+                reverse=False,
+            )
+
             if self.map_type == 'bunker' and len(ally_units_sorted) == self.n_agents + 1:
                 self.bunker = ally_units_sorted.pop(0)
                 self.bunker_passengers = []
@@ -1184,11 +1268,19 @@ class StarCraft2Env(MultiAgentEnv):
                 if self.debug_inputs:
                     print("Unit %d is %d, x = %.1f, y = %1.f"  % (len(self.agents), self.agents[i].unit_type, self.agents[i].pos.x, self.agents[i].pos.y))
 
-            for unit in self._obs.observation.raw_data.units:
-                if unit.owner == 2:
-                    self.enemies[len(self.enemies)] = unit
-                    if self._episode_count == 1:
-                        self.max_reward += unit.health_max + unit.shield_max
+            for i in range(len(enemy_units_sorted)):
+                self.enemies[i] = enemy_units_sorted[i]
+                if self.debug_inputs:
+                    print(
+                        "Enemy Unit {} is {}, x = {}, y = {}".format(
+                            len(self.enemies),
+                            self.enemies[i].unit_type,
+                            self.enemies[i].pos.x,
+                            self.enemies[i].pos.y
+                        )
+                    )
+                if self._episode_count == 1:
+                    self.max_reward += self.enemies[i].health_max + self.enemies[i].shield_max
 
             if self.map_type == '2step':
                 zealots = [unit for unit in self._obs.observation.raw_data.units if unit.owner == 2 and unit.unit_type == 73]
@@ -1200,6 +1292,12 @@ class StarCraft2Env(MultiAgentEnv):
                 self.init_ally_unit_types(min_unit_type)
 
             if len(self.agents) == self.n_agents and len(self.enemies) == self.n_enemies:
+                if self._episode_count == 1:
+                    self.feature_vector = self.generate_feature_vector()
+                    self.weight_vector = self.generateWeightVector()
+                    self.weight_vector /= self.max_reward / self.reward_scale_rate
+                    for feat_id, feat in enumerate(self.feature_vector):
+                        print(feat, self.weight_vector[feat_id])
                 # All good
                 return
 

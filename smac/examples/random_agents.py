@@ -8,7 +8,7 @@ import numpy as np
 
 def main():
     env_args = {
-            "map_name": "2_corridors",
+            "map_name": "4step",
             "difficulty": "7",
             "move_amount": 2,
             "step_mul": 8,
@@ -32,7 +32,7 @@ def main():
             "obs_terrain_height": False,
             "obs_last_action": False,
             "bunker_enter_range": 5,
-            "seed": 5452
+            "seed": None
         }
     env = StarCraft2Env(env_args=env_args)
     env_info = env.get_env_info()
@@ -58,7 +58,7 @@ def main():
                 action = np.random.choice(avail_actions_ind)
                 actions.append(action)
 
-            reward, terminated, _ = env.step(actions)
+            reward, f, terminated, _ = env.step(actions)
             episode_reward += reward
 
         print("Total reward in episode {} = {}".format(e, episode_reward))

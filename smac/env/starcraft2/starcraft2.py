@@ -206,6 +206,9 @@ class StarCraft2Env(MultiAgentEnv):
         for e_id in range(self.n_enemies):
             feats.append(("health_diff", "enemy", e_id))
             feats.append(("dead", "enemy", e_id))
+        if self.map_type == '3step':
+            feats.append("position_x")
+
         feats.append("win")
         return feats
 
@@ -228,6 +231,9 @@ class StarCraft2Env(MultiAgentEnv):
 
             en_weights.append(health_scale * (e_unit.health_max + e_unit.shield_max))
             en_weights.append(scale_to_use * self.reward_death_value)
+
+        if self.map_type == '3step':
+            en_weights.append(0.2 * self.max_reward)
 
         en_weights.append(self.reward_win)
 
@@ -418,6 +424,7 @@ class StarCraft2Env(MultiAgentEnv):
                 x2 = self.agents[1].pos.x
 
                 if 21 < x1 < 34 and 21 < x2 < 34:
+                    step_feature[-2] = 1.0
                     reward += 0.2 * self.max_reward
 
             if self.map_name == '4step' and self.agents[0].pos.y < 11 and self.agents[1].pos.y < 11:
@@ -426,6 +433,7 @@ class StarCraft2Env(MultiAgentEnv):
                 x2 = self.agents[1].pos.x
 
                 if 20 < x1 < 28 and 20 < x2 < 28:
+                    step_feature[-2] = 1.0
                     reward += 0.2 * self.max_reward
 
         if end_game is not None:
